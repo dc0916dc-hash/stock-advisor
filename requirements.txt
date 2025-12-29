@@ -5,3 +5,4 @@ twstock
 tqdm
 FinMind
 textblob
+requests

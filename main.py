@@ -8,11 +8,45 @@ from textblob import TextBlob
 import time
 import sys
 import datetime
+import requests
 
 # Constants
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = False
+LINE_TOKEN = "YOUR_TOKEN_HERE"
+
+def get_stock_name_cn(ticker):
+    """
+    Attempts to fetch the Chinese name of the stock using twstock.
+    Expects ticker format like '2330.TW' or '2330.TWO'.
+    Returns the Chinese name or the original ticker if not found.
+    """
+    try:
+        clean_code = ticker.split('.')[0]
+        if clean_code in twstock.codes:
+             return twstock.codes[clean_code].name
+        return ticker
+    except:
+        return ticker
+
+def send_line_notification(message):
+    """
+    Sends a message to LINE Notify.
+    """
+    url = 'https://notify-api.line.me/api/notify'
+    headers = {
+        'Authorization': f'Bearer {LINE_TOKEN}'
+    }
+    data = {
+        'message': message
+    }
+    try:
+        response = requests.post(url, headers=headers, data=data)
+        if response.status_code != 200:
+            print(f"Failed to send LINE notification: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending LINE notification: {e}")
 
 def get_stock_list():
     """
@@ -51,6 +85,7 @@ def analyze_technicals(ticker):
         'RSI': 0.0,
         'SMA20': 0.0,
         'SMA60': 0.0,
+        'ATR': 0.0,
         'Trend_Score': 0.0,
         'Past_Year_Return': 0.0,
         'Pass_Technical': False,
@@ -77,18 +112,23 @@ def analyze_technicals(ticker):
         df['SMA_20'] = df.ta.sma(length=20)
         df['SMA_60'] = df.ta.sma(length=60)
 
+        # ATR 14 (Volatillity)
+        # pandas_ta automatically uses High, Low, Close from df
+        df['ATR'] = df.ta.atr(length=14)
+
         # Get latest values
         current_close = df['Close'].iloc[-1]
         metrics['Price'] = current_close
 
         # Check if indicators are NaN (not enough data)
-        if pd.isna(df['RSI'].iloc[-1]) or pd.isna(df['SMA_60'].iloc[-1]):
+        if pd.isna(df['RSI'].iloc[-1]) or pd.isna(df['SMA_60'].iloc[-1]) or pd.isna(df['ATR'].iloc[-1]):
              metrics['Error'] = "Indicators NaN"
              return metrics
 
         metrics['RSI'] = df['RSI'].iloc[-1]
         metrics['SMA20'] = df['SMA_20'].iloc[-1]
         metrics['SMA60'] = df['SMA_60'].iloc[-1]
+        metrics['ATR'] = df['ATR'].iloc[-1]
 
         # Trend Score: ((Close - SMA60) / SMA60) * 100
         metrics['Trend_Score'] = ((current_close - metrics['SMA60']) / metrics['SMA60']) * 100
@@ -223,6 +263,10 @@ def main():
     for ticker in tqdm(stocks):
         # Step A: Analyze Technicals
         metrics = analyze_technicals(ticker)
+
+        # Populate Name (Chinese if available)
+        metrics['Name'] = get_stock_name_cn(ticker)
+
         all_results.append(metrics)
 
         # Step B: Check Filters
@@ -278,23 +322,73 @@ def main():
     # Pick Top 5
     top_picks = df_candidates.head(5).copy()
 
-    # Allocation
-    num_picks = len(top_picks)
-    budget_per_stock = INITIAL_CAPITAL / num_picks
+    # Allocation Logic (ATR + Cap)
+    # Risk per stock = 1% of Capital
+    # Stop Loss Distance = 2 * ATR
+    # Risk_Based_Shares = Risk_Amount / Stop_Loss_Distance
+    # Max_Cap_Shares = (Capital * 20%) / Price
 
-    top_picks['Allocated_Budget'] = budget_per_stock
-    # Calculate shares: floor division
-    top_picks['Suggested_Shares'] = (top_picks['Allocated_Budget'] / top_picks['Price']).astype(int)
+    risk_per_trade = INITIAL_CAPITAL * 0.01
+    max_position_value = INITIAL_CAPITAL * 0.20
+
+    suggested_shares_list = []
+    allocated_budget_list = [] # Risk_Amount_NTD (Actual Position Value)
+    stop_loss_list = []
+
+    for index, row in top_picks.iterrows():
+        price = row['Price']
+        atr = row['ATR']
+
+        # Stop Loss Price
+        stop_loss_price = price - (2 * atr)
+        stop_loss_list.append(round(stop_loss_price, 2))
+
+        # Sizing
+        stop_loss_dist = 2 * atr
+        if stop_loss_dist > 0:
+             risk_shares = risk_per_trade / stop_loss_dist
+        else:
+             risk_shares = 0
+
+        max_cap_shares = max_position_value / price
+
+        final_shares = int(min(risk_shares, max_cap_shares))
+        suggested_shares_list.append(final_shares)
+
+        allocated_budget_list.append(final_shares * price)
+
+    top_picks['Suggested_Shares'] = suggested_shares_list
+    top_picks['Risk_Amount_NTD'] = allocated_budget_list
+    top_picks['Stop_Loss_Price'] = stop_loss_list
 
     # Save Final Recommendations
     print("Saving final buy recommendations...")
+    # Add ATR to output if not already there (it is in candidates, so it's in top_picks)
     top_picks.to_csv('final_buy_recommendations.csv', index=False)
 
     # Print Console Table
     print("\n=== TOP BUY RECOMMENDATIONS ===")
-    cols_to_show = ['Ticker', 'Price', 'Trend_Score', 'Past_Year_Return', 'Foreign_Buy', 'News_Sentiment_Score', 'Suggested_Shares']
+    cols_to_show = ['Ticker', 'Name', 'Price', 'Trend_Score', 'ATR', 'Stop_Loss_Price', 'Suggested_Shares', 'Risk_Amount_NTD']
     print(top_picks[cols_to_show].to_string(index=False))
     print("===============================")
+
+    # LINE Notification
+    if not top_picks.empty:
+        top_1_name = top_picks.iloc[0]['Name']
+        top_1_score = round(top_picks.iloc[0]['Trend_Score'], 2)
+
+        # Get list of top 3 tickers
+        top_3_tickers = top_picks.head(3)['Name'].tolist() # Using Name is better
+        top_3_str = ", ".join([str(x) for x in top_3_tickers])
+
+        msg = (
+            f"\n【AI 投資日報】 分析完成！\n"
+            f"選出強勢股：[{top_3_str}]\n"
+            f"最高分：{top_1_name} (Score: {top_1_score})\n"
+            f"請查看雲端報表。"
+        )
+        print("Sending LINE notification...")
+        send_line_notification(msg)
 
 if __name__ == "__main__":
     main()
