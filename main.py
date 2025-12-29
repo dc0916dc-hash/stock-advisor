@@ -48,6 +48,39 @@ def send_line_notification(message):
     except Exception as e:
         print(f"Error sending LINE notification: {e}")
 
+def check_market_status():
+    """
+    Checks the Taiwan Weighted Index (^TWII) status.
+    Returns (is_bullish, message, current_price, sma60).
+    Strict Safety: Returns False if data fetch fails.
+    """
+    print("Checking Market Status (^TWII)...")
+    try:
+        market = yf.Ticker("^TWII")
+        # Fetch 1y history to ensure enough data for SMA60
+        df = market.history(period="1y")
+
+        if df.empty or len(df) < 60:
+            return False, "Insufficient Market Data", 0, 0
+
+        # Calculate SMA60
+        df['SMA_60'] = df.ta.sma(length=60, close='Close')
+
+        current_close = df['Close'].iloc[-1]
+        sma60 = df['SMA_60'].iloc[-1]
+
+        if pd.isna(sma60):
+            return False, "Market SMA60 NaN", current_close, 0
+
+        if current_close > sma60:
+            return True, "Bullish", current_close, sma60
+        else:
+            return False, "Bearish (Below SMA60)", current_close, sma60
+
+    except Exception as e:
+        print(f"Market Check Error: {e}")
+        return False, f"Error: {str(e)}", 0, 0
+
 def get_stock_list():
     """
     Generates a list of Taiwan stock tickers with appropriate suffixes (.TW or .TWO).
@@ -86,6 +119,7 @@ def analyze_technicals(ticker):
         'SMA20': 0.0,
         'SMA60': 0.0,
         'ATR': 0.0,
+        'Trailing_Exit_Price': 0.0,
         'Trend_Score': 0.0,
         'Past_Year_Return': 0.0,
         'Pass_Technical': False,
@@ -129,6 +163,11 @@ def analyze_technicals(ticker):
         metrics['SMA20'] = df['SMA_20'].iloc[-1]
         metrics['SMA60'] = df['SMA_60'].iloc[-1]
         metrics['ATR'] = df['ATR'].iloc[-1]
+
+        # Trailing Exit: Highest High (20d) - 3 * ATR
+        # We need rolling max of High for 20 days
+        highest_high_20 = df['High'].tail(20).max()
+        metrics['Trailing_Exit_Price'] = highest_high_20 - (3 * metrics['ATR'])
 
         # Trend Score: ((Close - SMA60) / SMA60) * 100
         metrics['Trend_Score'] = ((current_close - metrics['SMA60']) / metrics['SMA60']) * 100
@@ -253,6 +292,18 @@ def main():
     print("Starting Stock Analysis Tool...")
     print(f"Configuration: Capital={INITIAL_CAPITAL}, Target Return={TARGET_ANNUAL_RETURN}, TEST_MODE={TEST_MODE}")
 
+    # 0. Market Regime Filter
+    is_bullish, market_msg, market_price, market_sma60 = check_market_status()
+
+    if not is_bullish:
+        # Market is Bearish or Error
+        print(f"⚠️ SYSTEM HALTED: {market_msg}")
+        halt_msg = f"\n⚠️ 系統暫停 (System Halted): 無法偵測大盤趨勢或大盤位於空頭 (^TWII < 60MA)。為保護資金，今日暫停選股。\nStatus: {market_msg}\nPrice: {market_price:.2f}, SMA60: {market_sma60:.2f}"
+        send_line_notification(halt_msg)
+        return
+
+    print(f"Market Status: Bullish (Price: {market_price:.2f} > SMA60: {market_sma60:.2f}). Proceeding...")
+
     # 1. Get Stock List
     stocks = get_stock_list()
 
@@ -368,7 +419,7 @@ def main():
 
     # Print Console Table
     print("\n=== TOP BUY RECOMMENDATIONS ===")
-    cols_to_show = ['Ticker', 'Name', 'Price', 'Trend_Score', 'ATR', 'Stop_Loss_Price', 'Suggested_Shares', 'Risk_Amount_NTD']
+    cols_to_show = ['Ticker', 'Name', 'Price', 'Trend_Score', 'ATR', 'Stop_Loss_Price', 'Trailing_Exit_Price', 'Suggested_Shares', 'Risk_Amount_NTD']
     print(top_picks[cols_to_show].to_string(index=False))
     print("===============================")
 
@@ -383,6 +434,7 @@ def main():
 
         msg = (
             f"\n【AI 投資日報】 分析完成！\n"
+            f"市場狀態: 多頭 (Bullish)\n"
             f"選出強勢股：[{top_3_str}]\n"
             f"最高分：{top_1_name} (Score: {top_1_score})\n"
             f"請查看雲端報表。"
