@@ -6,3 +6,4 @@ tqdm
 FinMind
 textblob
 requests
+google-genai

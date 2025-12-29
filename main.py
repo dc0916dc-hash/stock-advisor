@@ -9,12 +9,14 @@ import time
 import sys
 import datetime
 import requests
+from google import genai
 
 # Constants
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = False
 LINE_TOKEN = "YOUR_TOKEN_HERE"
+GEMINI_API_KEY = "YOUR_KEY_HERE"
 
 def get_stock_name_cn(ticker):
     """
@@ -47,6 +49,38 @@ def send_line_notification(message):
             print(f"Failed to send LINE notification: {response.status_code}")
     except Exception as e:
         print(f"Error sending LINE notification: {e}")
+
+def get_ai_commentary(stock_metrics):
+    """
+    Uses Gemini 3 to generate a brief buy recommendation in Traditional Chinese.
+    """
+    print(f"Generating AI Commentary for {stock_metrics['Name']}...")
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        prompt = (
+            f"You are a professional Taiwan stock analyst. "
+            f"Analyze these technicals and chips data for {stock_metrics['Name']} ({stock_metrics['Ticker']}):\n"
+            f"Price: {stock_metrics['Price']}\n"
+            f"Trend Score: {stock_metrics['Trend_Score']:.2f}\n"
+            f"RSI: {stock_metrics['RSI']:.2f}\n"
+            f"Foreign Net Buy: {stock_metrics['Foreign_Buy']}\n"
+            f"News Sentiment: {stock_metrics['News_Sentiment_Score']:.2f}\n"
+            f"Write a concise buy recommendation in Traditional Chinese (under 50 words)."
+        )
+
+        response = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=prompt
+        )
+
+        if response.text:
+            return response.text.strip()
+        return "AI Analysis Unavailable."
+
+    except Exception as e:
+        print(f"Gemini AI Error: {e}")
+        return "AI Analysis Failed (Check API Key)."
 
 def check_market_status():
     """
@@ -425,8 +459,13 @@ def main():
 
     # LINE Notification
     if not top_picks.empty:
-        top_1_name = top_picks.iloc[0]['Name']
-        top_1_score = round(top_picks.iloc[0]['Trend_Score'], 2)
+        top_1_data = top_picks.iloc[0]
+        top_1_name = top_1_data['Name']
+        top_1_score = round(top_1_data['Trend_Score'], 2)
+
+        # AI Analysis for Top 1
+        ai_comment = get_ai_commentary(top_1_data)
+        print(f"AI Commentary: {ai_comment}")
 
         # Get list of top 3 tickers
         top_3_tickers = top_picks.head(3)['Name'].tolist() # Using Name is better
@@ -437,6 +476,7 @@ def main():
             f"市場狀態: 多頭 (Bullish)\n"
             f"選出強勢股：[{top_3_str}]\n"
             f"最高分：{top_1_name} (Score: {top_1_score})\n"
+            f"【Gemini AI 點評】\n{ai_comment}\n"
             f"請查看雲端報表。"
         )
         print("Sending LINE notification...")
