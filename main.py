@@ -15,8 +15,7 @@ from google import genai
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
-LINE_CHANNEL_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
-LINE_USER_ID = "YOUR_USER_ID"
+DISCORD_WEBHOOK_URL = "YOUR_WEBHOOK_URL_HERE"
 GEMINI_API_KEY = "YOUR_KEY_HERE"
 
 def get_stock_name_cn(ticker):
@@ -33,30 +32,19 @@ def get_stock_name_cn(ticker):
     except:
         return ticker
 
-def send_line_notification(message):
+def send_discord_notification(message):
     """
-    Sends a push message using LINE Messaging API.
+    Sends a message to Discord via Webhook.
     """
-    url = 'https://api.line.me/v2/bot/message/push'
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
-    }
     data = {
-        'to': LINE_USER_ID,
-        'messages': [
-            {
-                'type': 'text',
-                'text': message
-            }
-        ]
+        "content": message
     }
     try:
-        response = requests.post(url, headers=headers, json=data)
-        if response.status_code != 200:
-            print(f"Failed to send LINE notification: {response.status_code} {response.text}")
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        if response.status_code != 204 and response.status_code != 200:
+            print(f"Failed to send Discord notification: {response.status_code} {response.text}")
     except Exception as e:
-        print(f"Error sending LINE notification: {e}")
+        print(f"Error sending Discord notification: {e}")
 
 def get_ai_commentary(stock_metrics):
     """
@@ -340,8 +328,13 @@ def main():
     if not is_bullish:
         # Market is Bearish or Error
         print(f"⚠️ SYSTEM HALTED: {market_msg}")
-        halt_msg = f"\n⚠️ 系統暫停 (System Halted): 無法偵測大盤趨勢或大盤位於空頭 (^TWII < 60MA)。為保護資金，今日暫停選股。\nStatus: {market_msg}\nPrice: {market_price:.2f}, SMA60: {market_sma60:.2f}"
-        send_line_notification(halt_msg)
+        halt_msg = (
+            f"**⚠️ 系統暫停 (System Halted)**\n"
+            f"無法偵測大盤趨勢或大盤位於空頭 (^TWII < 60MA)。為保護資金，今日暫停選股。\n"
+            f"Status: {market_msg}\n"
+            f"Price: {market_price:.2f}, SMA60: {market_sma60:.2f}"
+        )
+        send_discord_notification(halt_msg)
         return
 
     print(f"Market Status: Bullish (Price: {market_price:.2f} > SMA60: {market_sma60:.2f}). Proceeding...")
@@ -465,11 +458,13 @@ def main():
     print(top_picks[cols_to_show].to_string(index=False))
     print("===============================")
 
-    # LINE Notification
+    # Discord Notification
     if not top_picks.empty:
         top_1_data = top_picks.iloc[0]
         top_1_name = top_1_data['Name']
         top_1_score = round(top_1_data['Trend_Score'], 2)
+        top_1_ticker = top_1_data['Ticker']
+        top_1_price = top_1_data['Price']
 
         # AI Analysis for Top 1
         ai_comment = get_ai_commentary(top_1_data)
@@ -480,15 +475,17 @@ def main():
         top_3_str = ", ".join([str(x) for x in top_3_tickers])
 
         msg = (
-            f"\n【AI 投資日報】 分析完成！\n"
-            f"市場狀態: 多頭 (Bullish)\n"
-            f"選出強勢股：[{top_3_str}]\n"
-            f"最高分：{top_1_name} (Score: {top_1_score})\n"
-            f"【Gemini AI 點評】\n{ai_comment}\n"
+            f"**【AI 投資日報】**\n"
+            f"市場狀態: **多頭 (Bullish)**\n"
+            f"選出強勢股：**[{top_3_str}]**\n"
+            f"🔥 冠軍股：**{top_1_name} ({top_1_ticker})**\n"
+            f"💰 收盤價：{top_1_price}\n"
+            f"> 💡 **Gemini 觀點：**\n"
+            f"> {ai_comment}\n"
             f"請查看雲端報表。"
         )
-        print("Sending LINE notification...")
-        send_line_notification(msg)
+        print("Sending Discord notification...")
+        send_discord_notification(msg)
 
 if __name__ == "__main__":
     main()
