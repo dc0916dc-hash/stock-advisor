@@ -1,0 +1,9 @@
+yfinance
+pandas
+pandas_ta
+twstock
+tqdm
+FinMind
+textblob
+requests
+google-genai
