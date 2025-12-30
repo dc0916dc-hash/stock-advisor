@@ -17,13 +17,10 @@ INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Validate Keys
 if not DISCORD_WEBHOOK_URL:
     raise ValueError("Missing Environment Variable: DISCORD_WEBHOOK_URL. Please set this in GitHub Secrets.")
-if not GEMINI_API_KEY:
-    raise ValueError("Missing Environment Variable: GEMINI_API_KEY. Please set this in GitHub Secrets.")
 
 def get_stock_name_cn(ticker):
     """
@@ -55,11 +52,12 @@ def send_discord_notification(message):
 
 def get_ai_commentary(stock_metrics):
     """
-    Uses Gemini 3 to generate a brief buy recommendation in Traditional Chinese.
+    Uses Gemini 2.5 Flash to generate a brief buy recommendation in Traditional Chinese.
     """
     print(f"Generating AI Commentary for {stock_metrics['Name']}...")
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        # client automatically detects GEMINI_API_KEY from environment variables
+        client = genai.Client()
 
         prompt = (
             f"You are a professional Taiwan stock analyst. "
@@ -73,7 +71,7 @@ def get_ai_commentary(stock_metrics):
         )
 
         response = client.models.generate_content(
-            model="gemini-3-pro-preview",
+            model="gemini-2.5-flash",
             contents=prompt
         )
 
