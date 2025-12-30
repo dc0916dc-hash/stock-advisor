@@ -16,7 +16,7 @@ INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1455362289376034927/i5xvs2qI79OYnqnTo8HBrYRm109Ca9YbnbgqiHkuNig3YJE7zDJCFF6_zSsJsnujGuf2"
-GEMINI_API_KEY = "AIzaSyCOIARP47x765E5OjYCcSeFPxwShxlolNg"
+GEMINI_API_KEY = "AIzaSyBs41t52kvuTG_AyOfTtThiZ-g93nVEAPE"
 
 def get_stock_name_cn(ticker):
     """
