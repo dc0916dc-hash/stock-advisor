@@ -66,7 +66,8 @@ def get_ai_commentary(stock_metrics):
         )
 
         response = client.models.generate_content(
-            model="gemini-3-pro-preview",
+            model="gemini-3-flash-preview
+",
             contents=prompt
         )
 
