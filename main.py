@@ -14,8 +14,9 @@ from google import genai
 # Constants
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
-TEST_MODE = False
-LINE_TOKEN = "YOUR_TOKEN_HERE"
+TEST_MODE = True
+LINE_CHANNEL_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+LINE_USER_ID = "YOUR_USER_ID"
 GEMINI_API_KEY = "YOUR_KEY_HERE"
 
 def get_stock_name_cn(ticker):
@@ -34,19 +35,26 @@ def get_stock_name_cn(ticker):
 
 def send_line_notification(message):
     """
-    Sends a message to LINE Notify.
+    Sends a push message using LINE Messaging API.
     """
-    url = 'https://notify-api.line.me/api/notify'
+    url = 'https://api.line.me/v2/bot/message/push'
     headers = {
-        'Authorization': f'Bearer {LINE_TOKEN}'
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
     }
     data = {
-        'message': message
+        'to': LINE_USER_ID,
+        'messages': [
+            {
+                'type': 'text',
+                'text': message
+            }
+        ]
     }
     try:
-        response = requests.post(url, headers=headers, data=data)
+        response = requests.post(url, headers=headers, json=data)
         if response.status_code != 200:
-            print(f"Failed to send LINE notification: {response.status_code}")
+            print(f"Failed to send LINE notification: {response.status_code} {response.text}")
     except Exception as e:
         print(f"Error sending LINE notification: {e}")
 
