@@ -176,10 +176,16 @@ def get_recent_performance_summary(portfolio, limit=5):
         sell_reason = trade.get('reason', 'N/A')
 
         result = "WIN" if pnl > 0 else "LOSS"
+
+        # Extract rich indicators with defaults for legacy data
+        inds = trade.get('indicators', {})
+        rsi = inds.get('RSI', 'N/A')
+        macd = inds.get('MACD_Hist', 'N/A')
+        bb = inds.get('BB_Pct', 'N/A')
+        ma = inds.get('MA_Trend', 'N/A')
+
         summary.append(
-            f"{i}. {ticker} ({result} {pnl:+.2f}%)\n"
-            f"   - Buy Reason: {buy_reason}\n"
-            f"   - Sell Reason: {sell_reason}"
+            f"• {ticker} ({result} {pnl:+.2f}%): {buy_reason} -> {sell_reason} | Ind: RSI={rsi}, MACD={macd}, BB%={bb}, MA={ma}"
         )
 
     if not summary:
@@ -287,7 +293,9 @@ def get_ai_analysis(stock_metrics, context=None, history_summary=""):
             learning_str = (
                 f"🔍 SELF-REFLECTION & LEARNING:\n"
                 f"Review your recent trade history below. Identify patterns in your Wins and Losses.\n"
-                f"Instruction: If recent trades are losing, tighten criteria. If winning, apply successful patterns.\n"
+                f"Instruction: Analyze the MACD and BB% values in the history lines above.\n"
+                f"- If you see repeated losses when MACD was negative or BB% < 0 (Catching Knives), avoid that setup now.\n"
+                f"- If you see wins when MACD was positive (Momentum), favor that setup.\n"
                 f"{history_summary}\n\n"
             )
 
@@ -446,7 +454,10 @@ def manage_holdings(portfolio):
                     "reason": reason, # Sell Reason
                     "indicators": {
                         "RSI": round(metrics['RSI'], 2),
-                        "Trend": round(metrics['Trend_Score'], 2)
+                        "Trend": round(metrics['Trend_Score'], 2),
+                        "MACD_Hist": round(metrics.get('MACD_Hist', 0), 4),
+                        "BB_Pct": round(metrics.get('BB_Pct', 0), 2),
+                        "MA_Trend": metrics.get('MA20_Status', 'N/A')
                     },
                     "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
@@ -484,7 +495,10 @@ def manage_holdings(portfolio):
                         "reason": reason,
                         "indicators": {
                             "RSI": round(metrics['RSI'], 2),
-                            "Trend": round(metrics['Trend_Score'], 2)
+                            "Trend": round(metrics['Trend_Score'], 2),
+                            "MACD_Hist": round(metrics.get('MACD_Hist', 0), 4),
+                            "BB_Pct": round(metrics.get('BB_Pct', 0), 2),
+                            "MA_Trend": metrics.get('MA20_Status', 'N/A')
                         },
                         "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
@@ -640,6 +654,13 @@ def process_buy_signals(portfolio, candidates):
                     "price": exec_price,
                     "shares": shares_to_buy,
                     "reason": reason_str,
+                    "indicators": {
+                        "RSI": round(candidate.get('RSI', 0), 2),
+                        "Trend": round(candidate.get('Trend_Score', 0), 2),
+                        "MACD_Hist": round(candidate.get('MACD_Hist', 0), 4),
+                        "BB_Pct": round(candidate.get('BB_Pct', 0), 2),
+                        "MA_Trend": candidate.get('MA20_Status', 'N/A')
+                    },
                     "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 portfolio['history'].append(log)
