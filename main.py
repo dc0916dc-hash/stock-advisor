@@ -10,6 +10,7 @@ import sys
 import datetime
 import requests
 import os
+import json
 from google import genai
 
 # Constants
@@ -18,6 +19,7 @@ TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+PORTFOLIO_FILE = "portfolio.json"
 
 # Validate Keys
 if not DISCORD_WEBHOOK_URL:
@@ -38,6 +40,66 @@ def get_stock_name_cn(ticker):
         return ticker
     except:
         return ticker
+
+def load_portfolio():
+    """
+    Loads portfolio from JSON file or creates a default one if not exists.
+    """
+    if os.path.exists(PORTFOLIO_FILE):
+        try:
+            with open(PORTFOLIO_FILE, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print("Error decoding portfolio.json, creating new.")
+
+    # Default Portfolio
+    return {
+        "balance": 100000,  # 100,000 TWD Initial Capital
+        "holdings": {},     # {"Ticker": Shares}
+        "history": []       # List of transaction logs
+    }
+
+def save_portfolio(portfolio):
+    """
+    Saves portfolio data to JSON file.
+    """
+    with open(PORTFOLIO_FILE, 'w') as f:
+        json.dump(portfolio, f, indent=4)
+
+def calculate_portfolio_value(portfolio):
+    """
+    Calculates total portfolio value (Cash + Market Value of Holdings).
+    Returns (total_value, profit_loss_pct, details_str).
+    """
+    total_value = portfolio['balance']
+    holdings_value = 0
+    details = []
+
+    for ticker, shares in portfolio['holdings'].items():
+        try:
+            # Fetch current price
+            # Note: In a real loop, we might have this data already, but for safety fetching fresh
+            stock = yf.Ticker(ticker)
+            # Use 'fast' fetch if possible, history(period='1d')
+            hist = stock.history(period="1d")
+            if not hist.empty:
+                current_price = hist['Close'].iloc[-1]
+                value = current_price * shares
+                holdings_value += value
+                details.append(f"{ticker}: {shares}股 (${value:,.0f})")
+            else:
+                # Fallback if no data (delisted?), assume cost basis or last known?
+                # For safety, just keep as 0 but warn
+                details.append(f"{ticker}: {shares}股 (No Data)")
+        except Exception:
+             details.append(f"{ticker}: {shares}股 (Error)")
+
+    total_value += holdings_value
+
+    initial_capital = 100000
+    pl_pct = ((total_value - initial_capital) / initial_capital) * 100
+
+    return total_value, pl_pct, ", ".join(details)
 
 def send_discord_notification(message):
     """
@@ -84,6 +146,84 @@ def get_ai_commentary(stock_metrics):
     except Exception as e:
         print(f"Gemini AI Error: {e}")
         return "AI Analysis Failed (Check API Key)."
+
+def process_sell_signals(portfolio):
+    """
+    Checks existing holdings for sell signals (Trend_Score < 0).
+    """
+    print("Processing Sell Signals for Holdings...")
+    updated_holdings = portfolio['holdings'].copy()
+
+    for ticker, shares in portfolio['holdings'].items():
+        try:
+            # We need to analyze the stock again to get the Trend_Score
+            # This fetches history again. Optimized? Maybe, but safe.
+            metrics = analyze_technicals(ticker)
+
+            # Sell Condition: Trend Score < 0
+            if metrics['Trend_Score'] < 0:
+                current_price = metrics['Price']
+                revenue = current_price * shares
+                portfolio['balance'] += revenue
+                del updated_holdings[ticker]
+
+                # Log
+                log = {
+                    "action": "SELL",
+                    "ticker": ticker,
+                    "price": current_price,
+                    "shares": shares,
+                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                portfolio['history'].append(log)
+                print(f"SELL SIGNAL: Sold {ticker} ({shares} shares) at {current_price}")
+
+        except Exception as e:
+            print(f"Error checking sell signal for {ticker}: {e}")
+
+    portfolio['holdings'] = updated_holdings
+    return portfolio
+
+def process_buy_signals(portfolio, candidates):
+    """
+    Checks top candidates for buy signals (Trend_Score > 3) and executes buy if cash allows.
+    Buys fixed 1000 shares (1 sheet) per signal for simplicity as per requirements.
+    """
+    print("Processing Buy Signals...")
+
+    for candidate in candidates:
+        ticker = candidate['Ticker']
+        price = candidate['Price']
+        score = candidate['Trend_Score']
+
+        # Buy Condition: Trend Score > 3
+        if score > 3:
+            cost = price * 1000
+
+            # Check Cash
+            if portfolio['balance'] >= cost:
+                portfolio['balance'] -= cost
+
+                # Add to holdings
+                if ticker in portfolio['holdings']:
+                    portfolio['holdings'][ticker] += 1000
+                else:
+                    portfolio['holdings'][ticker] = 1000
+
+                # Log
+                log = {
+                    "action": "BUY",
+                    "ticker": ticker,
+                    "price": price,
+                    "shares": 1000,
+                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                portfolio['history'].append(log)
+                print(f"BUY SIGNAL: Bought {ticker} (1000 shares) at {price}")
+            else:
+                print(f"Insufficient Cash to buy {ticker} (Cost: {cost})")
+
+    return portfolio
 
 def check_market_status():
     """
@@ -329,17 +469,34 @@ def main():
     print("Starting Stock Analysis Tool...")
     print(f"Configuration: Capital={INITIAL_CAPITAL}, Target Return={TARGET_ANNUAL_RETURN}, TEST_MODE={TEST_MODE}")
 
+    # Load Portfolio
+    portfolio = load_portfolio()
+
+    # Phase 1: Sell Check (Run regardless of market status)
+    portfolio = process_sell_signals(portfolio)
+
     # 0. Market Regime Filter
     is_bullish, market_msg, market_price, market_sma60 = check_market_status()
 
     if not is_bullish:
         # Market is Bearish or Error
         print(f"⚠️ SYSTEM HALTED: {market_msg}")
+
+        # Save Portfolio before exiting
+        save_portfolio(portfolio)
+
+        # Calculate Value for notification
+        total_val, pl_pct, details = calculate_portfolio_value(portfolio)
+
         halt_msg = (
             f"**⚠️ 系統暫停 (System Halted)**\n"
             f"無法偵測大盤趨勢或大盤位於空頭 (^TWII < 60MA)。為保護資金，今日暫停選股。\n"
             f"Status: {market_msg}\n"
-            f"Price: {market_price:.2f}, SMA60: {market_sma60:.2f}"
+            f"Price: {market_price:.2f}, SMA60: {market_sma60:.2f}\n\n"
+            f"**📊 模擬帳戶 (Paper Trading)**\n"
+            f"資產總值: ${total_val:,.0f} (P/L: {pl_pct:.2f}%)\n"
+            f"現金: ${portfolio['balance']:,.0f}\n"
+            f"持倉: {details}"
         )
         send_discord_notification(halt_msg)
         return
@@ -415,6 +572,14 @@ def main():
     # Pick Top 5
     top_picks = df_candidates.head(5).copy()
 
+    # Phase 3: Buy Signals (Paper Trading)
+    # Convert top_picks DataFrame to list of dicts for processing
+    top_candidates_list = top_picks.to_dict('records')
+    portfolio = process_buy_signals(portfolio, top_candidates_list)
+
+    # Save Portfolio
+    save_portfolio(portfolio)
+
     # Allocation Logic (ATR + Cap)
     # Risk per stock = 1% of Capital
     # Stop Loss Distance = 2 * ATR
@@ -481,6 +646,9 @@ def main():
         top_3_tickers = top_picks.head(3)['Name'].tolist() # Using Name is better
         top_3_str = ", ".join([str(x) for x in top_3_tickers])
 
+        # Calculate Value for notification
+        total_val, pl_pct, details = calculate_portfolio_value(portfolio)
+
         msg = (
             f"**【AI 投資日報】**\n"
             f"市場狀態: **多頭 (Bullish)**\n"
@@ -488,7 +656,11 @@ def main():
             f"🔥 冠軍股：**{top_1_name} ({top_1_ticker})**\n"
             f"💰 收盤價：{top_1_price}\n"
             f"> 💡 **Gemini 觀點：**\n"
-            f"> {ai_comment}\n"
+            f"> {ai_comment}\n\n"
+            f"**📊 模擬帳戶 (Paper Trading)**\n"
+            f"資產總值: ${total_val:,.0f} (P/L: {pl_pct:.2f}%)\n"
+            f"現金: ${portfolio['balance']:,.0f}\n"
+            f"持倉: {details}\n"
             f"請查看雲端報表。"
         )
         print("Sending Discord notification...")
