@@ -300,6 +300,11 @@ def get_ai_analysis(stock_metrics, context=None, history_summary=""):
             f"RSI: {stock_metrics['RSI']:.2f}\n"
             f"Foreign Net Buy: {stock_metrics['Foreign_Buy']}\n"
             f"News Sentiment: {stock_metrics['News_Sentiment_Score']:.2f}\n"
+            f"Technical Indicators:\n"
+            f"- MACD: {stock_metrics.get('MACD_Status', 'N/A')} (Hist: {stock_metrics.get('MACD_Hist', 0):.2f})\n"
+            f"- Bollinger Bands: Price is at {stock_metrics.get('BB_Pct', 0)*100:.1f}% of the band width.\n"
+            f"- Moving Averages: Price is {stock_metrics.get('MA20_Status', 'N/A')} MA20 and {stock_metrics.get('MA60_Status', 'N/A')} MA60.\n"
+            f"- Volume: {stock_metrics.get('Volume_Ratio', 1.0):.2f}x vs 5-day Avg\n"
         )
 
         if context:
@@ -765,6 +770,40 @@ def analyze_technicals(ticker):
         metrics['SMA20'] = df['SMA_20'].iloc[-1]
         metrics['SMA60'] = df['SMA_60'].iloc[-1]
         metrics['ATR'] = df['ATR'].iloc[-1]
+
+        # --- Advanced Indicators ---
+
+        # MACD (12, 26, 9)
+        macd = df.ta.macd(fast=12, slow=26, signal=9)
+        # pandas_ta returns columns: MACD_12_26_9, MACDh_12_26_9 (Hist), MACDs_12_26_9 (Signal)
+        metrics['MACD_Line'] = macd['MACD_12_26_9'].iloc[-1]
+        metrics['MACD_Signal'] = macd['MACDs_12_26_9'].iloc[-1]
+        metrics['MACD_Hist'] = macd['MACDh_12_26_9'].iloc[-1]
+
+        if metrics['MACD_Line'] > metrics['MACD_Signal']:
+            metrics['MACD_Status'] = "Bullish"
+        else:
+            metrics['MACD_Status'] = "Bearish"
+
+        # Bollinger Bands (20, 2)
+        bbands = df.ta.bbands(length=20, std=2)
+        # Columns: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBP_20_2.0 (%B)
+        metrics['BB_Pct'] = bbands['BBP_20_2.0'].iloc[-1]
+
+        # Volume Spike (Current vs SMA5)
+        # Check if Volume column exists and handle potential 0
+        if 'Volume' in df.columns:
+            vol_sma5 = df['Volume'].rolling(window=5).mean().iloc[-1]
+            current_vol = df['Volume'].iloc[-1]
+            if vol_sma5 > 0:
+                metrics['Volume_Ratio'] = current_vol / vol_sma5
+            else:
+                metrics['Volume_Ratio'] = 1.0
+        else:
+            metrics['Volume_Ratio'] = 1.0
+
+        metrics['MA20_Status'] = "Above" if current_close > metrics['SMA20'] else "Below"
+        metrics['MA60_Status'] = "Above" if current_close > metrics['SMA60'] else "Below"
 
         # Trailing Exit: Highest High (20d) - 3 * ATR
         # We need rolling max of High for 20 days
