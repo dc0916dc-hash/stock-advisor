@@ -17,6 +17,7 @@ from google import genai
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
+INTRADAY_MODE = True
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = "portfolio.json"
@@ -40,6 +41,30 @@ def get_stock_name_cn(ticker):
         return ticker
     except:
         return ticker
+
+def get_realtime_price(ticker):
+    """
+    Fetches the latest trade price from twstock realtime API.
+    Returns float price or None if failed.
+    """
+    try:
+        clean_code = ticker.split('.')[0]
+        realtime_data = twstock.realtime.get(clean_code)
+
+        if realtime_data['success']:
+            price_str = realtime_data['realtime']['latest_trade_price']
+            # Sometimes price is '-' if no trades yet, fallback to best bid/ask or previous close
+            if price_str == '-':
+                 # Try open
+                 price_str = realtime_data['realtime'].get('open', '-')
+
+            if price_str != '-':
+                return float(price_str)
+
+        return None
+    except Exception as e:
+        print(f"Error fetching realtime price for {ticker}: {e}")
+        return None
 
 def load_portfolio():
     """
@@ -170,15 +195,21 @@ def get_ai_analysis(stock_metrics, purpose="BUY"):
 def process_sell_signals(portfolio):
     """
     Checks existing holdings for sell signals (Trend_Score < 0).
+    Returns (portfolio, list_of_trade_messages).
     """
     print("Processing Sell Signals for Holdings...")
     updated_holdings = portfolio['holdings'].copy()
+    trade_messages = []
 
     for ticker, shares in portfolio['holdings'].items():
         try:
             # We need to analyze the stock again to get the Trend_Score and AI check
             metrics = analyze_technicals(ticker)
             metrics['Name'] = get_stock_name_cn(ticker) # Fetch name for AI
+
+            # Use Real-time price for execution
+            realtime_price = get_realtime_price(ticker)
+            exec_price = realtime_price if realtime_price else metrics['Price']
 
             # 1. Technical Sell Check
             tech_sell = metrics['Trend_Score'] < -5 # Hard Stop if Trend crashes
@@ -196,51 +227,63 @@ def process_sell_signals(portfolio):
 
             # Execute Sell if EITHER condition is true
             if tech_sell or ai_sell:
-                current_price = metrics['Price']
-                revenue = current_price * shares
+                revenue = exec_price * shares
                 portfolio['balance'] += revenue
                 del updated_holdings[ticker]
+
+                reason_str = ai_reason if ai_sell else "Trend Score < -5"
 
                 # Log
                 log = {
                     "action": "SELL",
                     "ticker": ticker,
-                    "price": current_price,
+                    "price": exec_price,
                     "shares": shares,
-                    "reason": ai_reason if ai_sell else "Trend Score < -5",
+                    "reason": reason_str,
                     "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 portfolio['history'].append(log)
-                print(f"SELL SIGNAL: Sold {ticker} ({shares} shares). Reason: {log['reason']}")
+
+                msg = f"🔴 **SELL**: {ticker} ({shares}股) @ {exec_price} | {reason_str}"
+                print(msg)
+                trade_messages.append(msg)
 
         except Exception as e:
             print(f"Error checking sell signal for {ticker}: {e}")
 
     portfolio['holdings'] = updated_holdings
-    return portfolio
+    return portfolio, trade_messages
 
 def process_buy_signals(portfolio, candidates):
     """
     Checks top candidates using AI for dynamic position sizing.
+    Returns (portfolio, list_of_trade_messages).
     """
     print("Processing Buy Signals (Smart Mode)...")
+    trade_messages = []
 
     for candidate in candidates:
         ticker = candidate['Ticker']
-        price = candidate['Price']
+
+        # Duplicate Prevention: Do not buy if already owned
+        if ticker in portfolio['holdings']:
+            print(f"Skipping {ticker}: Already in portfolio.")
+            continue
+
+        # Use Real-time price for execution if possible
+        realtime_price = get_realtime_price(ticker)
+        exec_price = realtime_price if realtime_price else candidate['Price']
 
         # 1. AI Analysis
         ai_result = get_ai_analysis(candidate, purpose="BUY")
 
         ai_decision = "HOLD"
         ai_confidence = 0
-        ai_reason = "No AI Analysis"
         ai_allocation = 0.10 # Default 10%
 
         if ai_result:
             ai_decision = ai_result.get("decision", "HOLD")
             ai_confidence = int(ai_result.get("confidence", 0))
-            ai_reason = ai_result.get("reason", "N/A")
             raw_allocation = ai_result.get("allocation_percent", 0.10)
 
             # Sanitization & Clamping
@@ -255,7 +298,6 @@ def process_buy_signals(portfolio, candidates):
             # Store for notification
             candidate['AI_Decision'] = ai_decision
             candidate['AI_Confidence'] = ai_confidence
-            candidate['AI_Reason'] = ai_reason
 
         # Buy Condition: AI says BUY and Confidence > 75
         if ai_decision == "BUY" and ai_confidence > 75:
@@ -265,15 +307,15 @@ def process_buy_signals(portfolio, candidates):
             invest_amount = current_cash * ai_allocation
 
             # Calculate shares
-            shares_to_buy = int(invest_amount / price)
+            shares_to_buy = int(invest_amount / exec_price)
 
             # Round down to nearest 10 if possible, else 1
             if shares_to_buy >= 10:
                 shares_to_buy = (shares_to_buy // 10) * 10
 
-            cost = shares_to_buy * price
+            cost = shares_to_buy * exec_price
 
-            # Final check on cash (rounding might have edge cases, though int() handles it mostly)
+            # Final check on cash
             if shares_to_buy > 0 and portfolio['balance'] >= cost:
                 portfolio['balance'] -= cost
 
@@ -282,23 +324,28 @@ def process_buy_signals(portfolio, candidates):
                 else:
                     portfolio['holdings'][ticker] = shares_to_buy
 
+                reason_str = f"AI: {ai_decision} ({ai_confidence}%) | Alloc: {ai_allocation*100:.1f}%"
+
                 # Log
                 log = {
                     "action": "BUY",
                     "ticker": ticker,
-                    "price": price,
+                    "price": exec_price,
                     "shares": shares_to_buy,
-                    "reason": f"AI Decision: {ai_decision} (Confidence: {ai_confidence}%) | Allocating: {ai_allocation*100:.1f}% of Cash",
+                    "reason": reason_str,
                     "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 portfolio['history'].append(log)
-                print(f"BUY SIGNAL: Bought {ticker} ({shares_to_buy} shares). Reason: {log['reason']}")
+
+                msg = f"🟢 **BUY**: {ticker} ({shares_to_buy}股) @ {exec_price} | {reason_str}"
+                print(msg)
+                trade_messages.append(msg)
             else:
                 print(f"Skipped {ticker}: Insufficient Cash for AI allocation (${invest_amount:,.0f})")
         else:
             print(f"Skipped {ticker}: AI says {ai_decision} ({ai_confidence}%)")
 
-    return portfolio
+    return portfolio, trade_messages
 
 def check_market_status():
     """
@@ -542,228 +589,191 @@ def get_news_sentiment(ticker):
 
 def main():
     print("Starting Stock Analysis Tool...")
-    print(f"Configuration: Capital={INITIAL_CAPITAL}, Target Return={TARGET_ANNUAL_RETURN}, TEST_MODE={TEST_MODE}")
+    if INTRADAY_MODE:
+        send_discord_notification("🟢 **Bot Started**: 盤中監控模式已啟動 (每 5 分鐘掃描一次)")
 
-    # Load Portfolio
-    portfolio = load_portfolio()
+    # Main Intraday Loop
+    while True:
+        try:
+            # Time Check (Taiwan Time: UTC+8)
+            tz_tw = datetime.timezone(datetime.timedelta(hours=8))
+            now = datetime.datetime.now(tz_tw)
 
-    # Phase 1: Sell Check (Run regardless of market status)
-    portfolio = process_sell_signals(portfolio)
+            # Simple Market Hours Check (09:00 - 13:30)
+            # This simplification assumes script is run on trading days.
+            market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
 
-    # 0. Market Regime Filter
-    is_bullish, market_msg, market_price, market_sma60 = check_market_status()
+            if INTRADAY_MODE:
+                print(f"Current Time: {now.strftime('%H:%M:%S')}")
+                if now < market_open:
+                    print("Pre-market. Waiting...")
+                    time.sleep(60)
+                    continue
+                elif now > market_close:
+                    print("Market Closed. Saving and Exiting.")
+                    # Load and Save one last time to be safe? (Not really needed if we saved in loop)
+                    break
 
-    if not is_bullish:
-        # Market is Bearish or Error
-        print(f"⚠️ SYSTEM HALTED: {market_msg}")
+            # --- START CYCLE ---
 
-        # Save Portfolio before exiting
-        save_portfolio(portfolio)
+            # Load Portfolio
+            portfolio = load_portfolio()
 
-        # Calculate Value for notification
-        total_val, pl_pct, details = calculate_portfolio_value(portfolio)
+            all_messages = []
 
-        halt_msg = (
-            f"**⚠️ 系統暫停 (System Halted)**\n"
-            f"無法偵測大盤趨勢或大盤位於空頭 (^TWII < 60MA)。為保護資金，今日暫停選股。\n"
-            f"Status: {market_msg}\n"
-            f"Price: {market_price:.2f}, SMA60: {market_sma60:.2f}\n\n"
-            f"**📊 模擬帳戶 (Paper Trading)**\n"
-            f"資產總值: ${total_val:,.0f} (P/L: {pl_pct:.2f}%)\n"
-            f"現金: ${portfolio['balance']:,.0f}\n"
-            f"持倉: {details}"
-        )
-        send_discord_notification(halt_msg)
-        return
+            # Phase 1: Sell Check (Run regardless of market status)
+            portfolio, sell_msgs = process_sell_signals(portfolio)
+            all_messages.extend(sell_msgs)
 
-    print(f"Market Status: Bullish (Price: {market_price:.2f} > SMA60: {market_sma60:.2f}). Proceeding...")
+            # 0. Market Regime Filter
+            is_bullish, market_msg, market_price, market_sma60 = check_market_status()
 
-    # 1. Get Stock List
-    stocks = get_stock_list()
+            if not is_bullish:
+                # Market is Bearish or Error
+                print(f"⚠️ Market Bearish/Error: {market_msg}. Skipping Buy Scan.")
 
-    all_results = []
-    candidates = []
+                # If we had sell messages, we should notify
+                if sell_msgs:
+                    halt_msg = (
+                        f"**⚠️ 系統暫停 (System Halted)**\n"
+                        f"市場狀態: {market_msg}\n"
+                        f"**Transactions:**\n" + "\n".join(sell_msgs)
+                    )
+                    send_discord_notification(halt_msg)
 
-    print("Step 1: Technical & Performance Scan")
-    for ticker in tqdm(stocks):
-        # Step A: Analyze Technicals
-        metrics = analyze_technicals(ticker)
+                # Save & Sleep
+                save_portfolio(portfolio)
 
-        # Populate Name (Chinese if available)
-        metrics['Name'] = get_stock_name_cn(ticker)
+                if INTRADAY_MODE:
+                    time.sleep(300)
+                    continue
+                else:
+                    return
 
-        all_results.append(metrics)
+            print(f"Market Status: Bullish. Proceeding to Scan...")
 
-        # Step B: Check Filters
-        if metrics['Pass_Technical'] and metrics['Pass_Performance']:
-            # Passed Initial Filters -> Deep Dive
+            # 1. Get Stock List
+            stocks = get_stock_list()
 
-            # Step C: Chips Analysis
-            f_buy, t_buy = get_chips_data(ticker)
-            metrics['Foreign_Buy'] = f_buy
-            metrics['Trust_Buy'] = t_buy
+            all_results = []
+            candidates = []
 
-            # Step D: News Sentiment
-            news_score, headline = get_news_sentiment(ticker)
-            metrics['News_Sentiment_Score'] = news_score
-            metrics['Latest_Headline'] = headline
+            print("Step 1: Technical & Performance Scan")
+            # If Intraday, maybe we don't need tqdm as it clogs logs? Keeping it for now.
+            for ticker in tqdm(stocks):
+                # Optimization: Check if we already hold it BEFORE scanning?
+                # Actually user requirement said check in buy logic, but checking here saves API calls.
+                # Requirement: "Duplicate Prevention: inside the loop, before analyzing a stock, check: if stock_id in portfolio["holdings"]: continue."
+                if ticker in portfolio['holdings']:
+                    continue
 
-            # Step E: News Safety Filter
-            if news_score < -0.2:
-                metrics['Pass_Safety'] = False
-                metrics['Rejection_Reason'] = "Negative News Sentiment"
+                # Step A: Analyze Technicals
+                metrics = analyze_technicals(ticker)
+
+                # Populate Name (Chinese if available)
+                metrics['Name'] = get_stock_name_cn(ticker)
+
+                all_results.append(metrics)
+
+                # Step B: Check Filters
+                if metrics['Pass_Technical'] and metrics['Pass_Performance']:
+                    # Passed Initial Filters -> Deep Dive
+
+                    # Step C: Chips Analysis
+                    f_buy, t_buy = get_chips_data(ticker)
+                    metrics['Foreign_Buy'] = f_buy
+                    metrics['Trust_Buy'] = t_buy
+
+                    # Step D: News Sentiment
+                    news_score, headline = get_news_sentiment(ticker)
+                    metrics['News_Sentiment_Score'] = news_score
+                    metrics['Latest_Headline'] = headline
+
+                    # Step E: News Safety Filter
+                    if news_score < -0.2:
+                        metrics['Pass_Safety'] = False
+                        metrics['Rejection_Reason'] = "Negative News Sentiment"
+                    else:
+                        metrics['Pass_Safety'] = True
+
+                        # Bonus for Positive News
+                        if news_score > 0.1:
+                            metrics['Trend_Score'] += 10
+
+                        candidates.append(metrics)
+                else:
+                    # Did not pass initial filters
+                    metrics['Foreign_Buy'] = 0
+                    metrics['Trust_Buy'] = 0
+                    metrics['News_Sentiment_Score'] = 0.0
+                    metrics['Latest_Headline'] = ""
+                    metrics['Pass_Safety'] = False
+
+            # Save All Results (Technical Scan)
+            # In loop mode, maybe we don't want to write CSV every 5 mins?
+            # Or overwrite is fine.
+            df_all = pd.DataFrame(all_results)
+            df_all.to_csv('all_technical_scan.csv', index=False)
+
+            # Process Candidates (Portfolio Allocation)
+            print(f"Found {len(candidates)} candidates passing all filters.")
+
+            if candidates:
+                # Sort by Trend Score (Descending)
+                df_candidates = pd.DataFrame(candidates)
+                df_candidates = df_candidates.sort_values(by='Trend_Score', ascending=False)
+
+                # Pick Top 5
+                top_picks = df_candidates.head(5).copy()
+
+                # Phase 3: Buy Signals (Paper Trading)
+                top_candidates_list = top_picks.to_dict('records')
+                portfolio, buy_msgs = process_buy_signals(portfolio, top_candidates_list)
+                all_messages.extend(buy_msgs)
+
+                # Save Portfolio
+                save_portfolio(portfolio)
+
+                # Generate Recommendations CSV (for record)
+                # Recalculate static sizing just for the CSV output (display only)
+                # Since we use dynamic sizing now, this part of the CSV is less relevant but kept for structure
+                # We can remove the old static logic block or keep it for the CSV display.
+                # Keeping the CSV export simple.
+                top_picks.to_csv('final_buy_recommendations.csv', index=False)
+
+            # Notification Logic (Quiet Mode)
+            if all_messages:
+                # Calculate Value for notification
+                total_val, pl_pct, details = calculate_portfolio_value(portfolio)
+
+                msg_body = "\n".join(all_messages)
+                msg = (
+                    f"**【AI 交易通知】**\n"
+                    f"{msg_body}\n\n"
+                    f"**📊 模擬帳戶**\n"
+                    f"淨值: ${total_val:,.0f} ({pl_pct:+.2f}%)\n"
+                    f"現金: ${portfolio['balance']:,.0f}"
+                )
+                send_discord_notification(msg)
             else:
-                metrics['Pass_Safety'] = True
+                print("No trades executed this cycle.")
 
-                # Bonus for Positive News
-                if news_score > 0.1:
-                    metrics['Trend_Score'] += 10
+            if not INTRADAY_MODE:
+                break
 
-                candidates.append(metrics)
-        else:
-            # Did not pass initial filters
-            metrics['Foreign_Buy'] = 0
-            metrics['Trust_Buy'] = 0
-            metrics['News_Sentiment_Score'] = 0.0
-            metrics['Latest_Headline'] = ""
-            metrics['Pass_Safety'] = False
+            print("Cycle complete. Sleeping 5 minutes...")
+            time.sleep(300)
 
-    # Save All Results (Technical Scan)
-    print("Saving all technical scan results...")
-    df_all = pd.DataFrame(all_results)
-    df_all.to_csv('all_technical_scan.csv', index=False)
-
-    # Process Candidates (Portfolio Allocation)
-    print(f"Found {len(candidates)} candidates passing all filters.")
-
-    if not candidates:
-        print("No stocks passed all filters. Exiting.")
-        return
-
-    # Sort by Trend Score (Descending)
-    df_candidates = pd.DataFrame(candidates)
-    df_candidates = df_candidates.sort_values(by='Trend_Score', ascending=False)
-
-    # Pick Top 5
-    top_picks = df_candidates.head(5).copy()
-
-    # Phase 3: Buy Signals (Paper Trading)
-    # Convert top_picks DataFrame to list of dicts for processing
-    top_candidates_list = top_picks.to_dict('records')
-    portfolio = process_buy_signals(portfolio, top_candidates_list)
-
-    # Save Portfolio
-    save_portfolio(portfolio)
-
-    # Allocation Logic (ATR + Cap)
-    # Risk per stock = 1% of Capital
-    # Stop Loss Distance = 2 * ATR
-    # Risk_Based_Shares = Risk_Amount / Stop_Loss_Distance
-    # Max_Cap_Shares = (Capital * 20%) / Price
-
-    risk_per_trade = INITIAL_CAPITAL * 0.01
-    max_position_value = INITIAL_CAPITAL * 0.20
-
-    suggested_shares_list = []
-    allocated_budget_list = [] # Risk_Amount_NTD (Actual Position Value)
-    stop_loss_list = []
-
-    for index, row in top_picks.iterrows():
-        price = row['Price']
-        atr = row['ATR']
-
-        # Stop Loss Price
-        stop_loss_price = price - (2 * atr)
-        stop_loss_list.append(round(stop_loss_price, 2))
-
-        # Sizing
-        stop_loss_dist = 2 * atr
-        if stop_loss_dist > 0:
-             risk_shares = risk_per_trade / stop_loss_dist
-        else:
-             risk_shares = 0
-
-        max_cap_shares = max_position_value / price
-
-        final_shares = int(min(risk_shares, max_cap_shares))
-        suggested_shares_list.append(final_shares)
-
-        allocated_budget_list.append(final_shares * price)
-
-    top_picks['Suggested_Shares'] = suggested_shares_list
-    top_picks['Risk_Amount_NTD'] = allocated_budget_list
-    top_picks['Stop_Loss_Price'] = stop_loss_list
-
-    # Save Final Recommendations
-    print("Saving final buy recommendations...")
-    # Add ATR to output if not already there (it is in candidates, so it's in top_picks)
-    top_picks.to_csv('final_buy_recommendations.csv', index=False)
-
-    # Print Console Table
-    print("\n=== TOP BUY RECOMMENDATIONS ===")
-    cols_to_show = ['Ticker', 'Name', 'Price', 'Trend_Score', 'ATR', 'Stop_Loss_Price', 'Trailing_Exit_Price', 'Suggested_Shares', 'Risk_Amount_NTD']
-    print(top_picks[cols_to_show].to_string(index=False))
-    print("===============================")
-
-    # Discord Notification
-    if not top_picks.empty:
-        top_1_data = top_picks.iloc[0]
-        top_1_name = top_1_data['Name']
-        top_1_score = round(top_1_data['Trend_Score'], 2)
-        top_1_ticker = top_1_data['Ticker']
-        top_1_price = top_1_data['Price']
-
-        # AI Analysis for Top 1 is already done in process_buy_signals logic usually,
-        # but here we display the Top 1 regardless of whether we bought it.
-        # If we didn't run buy logic (e.g. market bear), we don't have it.
-        # But we are in the "Bullish" block here.
-
-        # We need to fetch AI analysis if not present (process_buy_signals runs it)
-        # top_picks is a DataFrame, convert to dict for checking
-        # But wait, we passed 'top_candidates_list' to process_buy_signals which modified the dicts in place.
-        # The 'top_picks' DataFrame was created BEFORE process_buy_signals.
-
-        # Simpler: Just get the AI result from the list we processed
-        top_1_processed = top_candidates_list[0]
-
-        ai_decision = top_1_processed.get('AI_Decision', 'N/A')
-        ai_conf = top_1_processed.get('AI_Confidence', 0)
-        ai_reason = top_1_processed.get('AI_Reason', 'Analysis Pending')
-
-        # Determine allocation message if available
-        ai_alloc_msg = ""
-        if ai_decision == "BUY" and ai_conf > 75:
-             # Just a visual estimate, not the actual execution which depends on cash
-             # But we can show what the AI *wanted*
-             # Note: We didn't save the sanitized 'ai_allocation' back to the dict easily accessible here unless we stored it.
-             # We only stored Decision/Confidence/Reason.
-             # We can just say "Allocating: %" if we had it.
-             # Let's keep it simple: "AI Decision: BUY (Confidence: 85%)"
-             pass
-
-        # Get list of top 3 tickers
-        top_3_tickers = top_picks.head(3)['Name'].tolist()
-        top_3_str = ", ".join([str(x) for x in top_3_tickers])
-
-        # Calculate Value for notification
-        total_val, pl_pct, details = calculate_portfolio_value(portfolio)
-
-        msg = (
-            f"**【AI 投資日報】**\n"
-            f"市場狀態: **多頭 (Bullish)**\n"
-            f"選出強勢股：**[{top_3_str}]**\n"
-            f"🔥 冠軍股：**{top_1_name} ({top_1_ticker})**\n"
-            f"💰 收盤價：{top_1_price}\n"
-            f"> 🤖 **AI 決策：** {ai_decision} (信心: {ai_conf}%)\n"
-            f"> 💡 **分析理由：** {ai_reason}\n\n"
-            f"**📊 模擬帳戶 (Paper Trading)**\n"
-            f"資產總值: ${total_val:,.0f} (P/L: {pl_pct:.2f}%)\n"
-            f"現金: ${portfolio['balance']:,.0f}\n"
-            f"持倉: {details}\n"
-            f"請查看雲端報表。"
-        )
-        print("Sending Discord notification...")
-        send_discord_notification(msg)
+        except KeyboardInterrupt:
+            print("Bot stopped by user.")
+            break
+        except Exception as e:
+            print(f"Unexpected Error in Main Loop: {e}")
+            if INTRADAY_MODE:
+                time.sleep(60) # Short sleep on error
+            else:
+                break
 
 if __name__ == "__main__":
     main()
