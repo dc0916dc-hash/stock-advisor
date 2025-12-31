@@ -11,16 +11,28 @@ import datetime
 import requests
 import os
 import json
+import random
+import time
 from google import genai
 
 # Constants
-INITIAL_CAPITAL = 1000000
+INITIAL_CAPITAL = 100000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
 INTRADAY_MODE = True
+MAX_POSITION_RATIO = 0.40
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = "portfolio.json"
+
+# TW50 Candidates for Intraday Scanning (Top 50 by Cap/Volume)
+TW50_CANDIDATES = [
+    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2303.TW", "2881.TW", "2882.TW", "2886.TW", "2891.TW", "2884.TW",
+    "2002.TW", "1216.TW", "2412.TW", "2382.TW", "2892.TW", "2880.TW", "2885.TW", "3008.TW", "2357.TW", "2890.TW",
+    "1101.TW", "3045.TW", "2883.TW", "2887.TW", "3711.TW", "2327.TW", "3034.TW", "2912.TW", "2345.TW", "2408.TW",
+    "3037.TW", "2379.TW", "5880.TW", "1301.TW", "1303.TW", "1326.TW", "1402.TW", "2395.TW", "2603.TW", "2609.TW",
+    "2615.TW", "4904.TW", "4938.TW", "5871.TW", "5876.TW", "6505.TW", "6669.TW", "9910.TW"
+]
 
 # Validate Keys
 if not DISCORD_WEBHOOK_URL:
@@ -42,6 +54,37 @@ def get_stock_name_cn(ticker):
     except:
         return ticker
 
+def with_retry(retries=3, delay=10):
+    """
+    Decorator for retry logic with exponential backoff.
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for i in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    wait = delay * (2 ** i)
+                    print(f"Error in {func.__name__}: {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+            print(f"Failed to execute {func.__name__} after {retries} retries.")
+            return None
+        return wrapper
+    return decorator
+
+def calculate_transaction_fee(amount):
+    """
+    Calculates transaction fee: 0.1425%, min 20 TWD.
+    """
+    return max(20, int(amount * 0.001425))
+
+def calculate_tax(amount):
+    """
+    Calculates transaction tax: 0.3%.
+    """
+    return int(amount * 0.003)
+
+@with_retry()
 def get_realtime_price(ticker):
     """
     Fetches the latest trade price from twstock realtime API.
@@ -105,7 +148,7 @@ def load_portfolio():
 
     # Default Portfolio
     return {
-        "balance": 100000,  # 100,000 TWD Initial Capital
+        "balance": INITIAL_CAPITAL,  # Initial Capital from Constant
         "holdings": {},     # {"Ticker": {"shares": int, "cost": float}}
         "history": []       # List of transaction logs
     }
@@ -159,7 +202,7 @@ def calculate_portfolio_value(portfolio):
 
     total_value += holdings_value
 
-    initial_capital = 100000
+    initial_capital = INITIAL_CAPITAL
     pl_pct = ((total_value - initial_capital) / initial_capital) * 100
 
     return total_value, pl_pct, ", ".join(details)
@@ -193,6 +236,7 @@ def parse_ai_json(response_text):
         print(f"JSON Parse Error: {e}")
         return None
 
+@with_retry()
 def get_ai_analysis(stock_metrics, context=None):
     """
     Uses Gemini 2.5 Flash to generate a JSON decision.
@@ -270,6 +314,10 @@ def manage_holdings(portfolio):
 
     for ticker, data in portfolio['holdings'].items():
         processed_tickers.append(ticker)
+
+        # Random Delay for Anti-Ban
+        time.sleep(random.uniform(2.0, 4.0))
+
         # Handle format (migration should have ensured dict, but be safe)
         if isinstance(data, int):
             shares = data
@@ -313,11 +361,15 @@ def manage_holdings(portfolio):
 
             # CLEAR (Sell All)
             if action == "CLEAR":
-                revenue = exec_price * shares
-                portfolio['balance'] += revenue
+                gross_revenue = exec_price * shares
+                fee = calculate_transaction_fee(gross_revenue)
+                tax = calculate_tax(gross_revenue)
+                net_revenue = gross_revenue - fee - tax
+
+                portfolio['balance'] += net_revenue
                 del updated_holdings[ticker]
 
-                msg = f"🔴 **CLEAR**: {ticker} (All {shares} shares) @ {exec_price} | P/L: {profit_pct:.2f}% | {reason}"
+                msg = f"🔴 **CLEAR**: {ticker} (All {shares} shares) @ {exec_price} | Net: ${net_revenue:,.0f} (Fee: {fee}, Tax: {tax}) | P/L: {profit_pct:.2f}% | {reason}"
                 trade_messages.append(msg)
                 print(msg)
 
@@ -327,14 +379,18 @@ def manage_holdings(portfolio):
                 shares_to_sell = int(shares * sell_ratio)
 
                 if shares_to_sell > 0:
-                    revenue = exec_price * shares_to_sell
-                    portfolio['balance'] += revenue
+                    gross_revenue = exec_price * shares_to_sell
+                    fee = calculate_transaction_fee(gross_revenue)
+                    tax = calculate_tax(gross_revenue)
+                    net_revenue = gross_revenue - fee - tax
+
+                    portfolio['balance'] += net_revenue
                     updated_holdings[ticker]['shares'] -= shares_to_sell
 
                     if updated_holdings[ticker]['shares'] == 0:
                         del updated_holdings[ticker] # Fully reduced?
 
-                    msg = f"🟠 **REDUCE**: {ticker} ({shares_to_sell} shares) @ {exec_price} | {reason}"
+                    msg = f"🟠 **REDUCE**: {ticker} ({shares_to_sell} shares) @ {exec_price} | Net: ${net_revenue:,.0f} | {reason}"
                     trade_messages.append(msg)
                     print(msg)
 
@@ -343,6 +399,10 @@ def manage_holdings(portfolio):
                 alloc_ratio = max(0.01, min(percentage, 1.0)) # % of Cash
                 invest_amount = portfolio['balance'] * alloc_ratio
                 shares_to_buy = int(invest_amount / exec_price)
+
+                # Check Odd Lot Minimum
+                if shares_to_buy == 0 and invest_amount > exec_price:
+                    shares_to_buy = 1
 
                 # Check Global Cap
                 current_position_val = shares * exec_price
@@ -356,19 +416,23 @@ def manage_holdings(portfolio):
                     shares_to_buy = int(allowed_buy_val / exec_price)
                     print(f"ADD Clamped by 40% Cap for {ticker}. Reduced to {shares_to_buy} shares.")
 
-                if shares_to_buy > 0 and portfolio['balance'] >= (shares_to_buy * exec_price):
-                    cost = shares_to_buy * exec_price
-                    portfolio['balance'] -= cost
+                gross_cost = shares_to_buy * exec_price
+                fee = calculate_transaction_fee(gross_cost)
+                total_cost = gross_cost + fee
+
+                if shares_to_buy > 0 and portfolio['balance'] >= total_cost:
+                    portfolio['balance'] -= total_cost
 
                     # Update Avg Cost
                     total_shares_new = shares + shares_to_buy
-                    total_cost_new = (shares * avg_cost) + cost
-                    new_avg_cost = total_cost_new / total_shares_new
+                    # Cost basis includes fee
+                    total_cost_old = shares * avg_cost
+                    new_avg_cost = (total_cost_old + total_cost) / total_shares_new
 
                     updated_holdings[ticker]['shares'] = total_shares_new
                     updated_holdings[ticker]['cost'] = new_avg_cost
 
-                    msg = f"🟢 **ADD**: {ticker} ({shares_to_buy} shares) @ {exec_price} | New Cost: {new_avg_cost:.2f} | {reason}"
+                    msg = f"🟢 **ADD**: {ticker} ({shares_to_buy} shares) @ {exec_price} | Cost: ${total_cost:,.0f} (Fee: {fee}) | New Avg: {new_avg_cost:.2f} | {reason}"
                     trade_messages.append(msg)
                     print(msg)
 
@@ -395,6 +459,9 @@ def process_buy_signals(portfolio, candidates):
 
     for candidate in candidates:
         ticker = candidate['Ticker']
+
+        # Random Delay for Anti-Ban
+        time.sleep(random.uniform(2.0, 4.0))
 
         # Use Real-time price
         realtime_price = get_realtime_price(ticker)
@@ -427,6 +494,10 @@ def process_buy_signals(portfolio, candidates):
             invest_amount = portfolio['balance'] * ai_percentage
             shares_to_buy = int(invest_amount / exec_price)
 
+            # Check Odd Lot Minimum
+            if shares_to_buy == 0 and invest_amount > exec_price:
+                shares_to_buy = 1
+
             # 3. Global Cap Check (40%)
             # Projected holding value = 0 (since it's new) + new buy value
             projected_value = shares_to_buy * exec_price
@@ -437,16 +508,21 @@ def process_buy_signals(portfolio, candidates):
                 shares_to_buy = int(allowed_val / exec_price)
                 print(f"BUY Clamped by 40% Cap for {ticker}. Reduced to {shares_to_buy} shares.")
 
-            cost = shares_to_buy * exec_price
+            gross_cost = shares_to_buy * exec_price
+            fee = calculate_transaction_fee(gross_cost)
+            total_cost = gross_cost + fee
 
             # Final check on cash
-            if shares_to_buy > 0 and portfolio['balance'] >= cost:
-                portfolio['balance'] -= cost
+            if shares_to_buy > 0 and portfolio['balance'] >= total_cost:
+                portfolio['balance'] -= total_cost
 
-                # New Position
+                # New Position (Cost basis includes fee)
+                # Unit cost = Total Cost / Shares
+                avg_cost = total_cost / shares_to_buy
+
                 portfolio['holdings'][ticker] = {
                     "shares": shares_to_buy,
-                    "cost": exec_price
+                    "cost": avg_cost
                 }
 
                 reason_str = f"AI: {ai_action} | Alloc: {ai_percentage*100:.1f}% | {ai_reason}"
@@ -462,7 +538,7 @@ def process_buy_signals(portfolio, candidates):
                 }
                 portfolio['history'].append(log)
 
-                msg = f"🟢 **BUY**: {ticker} ({shares_to_buy}股) @ {exec_price} | {reason_str}"
+                msg = f"🟢 **BUY**: {ticker} ({shares_to_buy}股) @ {exec_price} | Cost: ${total_cost:,.0f} (Fee: {fee}) | {reason_str}"
                 print(msg)
                 trade_messages.append(msg)
             else:
@@ -530,6 +606,7 @@ def get_stock_list():
 
     return tickers
 
+@with_retry()
 def analyze_technicals(ticker):
     """
     Fetches history and performs technical analysis.
@@ -620,6 +697,7 @@ def analyze_technicals(ticker):
         metrics['Error'] = str(e)
         return metrics
 
+@with_retry()
 def get_chips_data(stock_id):
     """
     Fetches Foreign and Investment Trust Net Buy data using FinMind.
@@ -677,6 +755,7 @@ def get_chips_data(stock_id):
         # print(f"FinMind Error for {stock_id}: {e}") # Optional debug
         return 0, 0
 
+@with_retry()
 def get_news_sentiment(ticker):
     """
     Fetches top 3 news headlines from yfinance and calculates average sentiment.
@@ -785,12 +864,21 @@ def main():
             all_results = []
             candidates = []
 
+            # Step 2: Scan (Use TW50 subset for intraday speed)
             print("Step 2: Technical & Performance Scan (Candidates)")
-            # If Intraday, maybe we don't need tqdm as it clogs logs? Keeping it for now.
-            for ticker in tqdm(stocks):
+
+            scan_list = stocks
+            if INTRADAY_MODE:
+                scan_list = TW50_CANDIDATES
+                print(f"Intraday Mode: Scanning Top {len(scan_list)} stocks only.")
+
+            for ticker in tqdm(scan_list):
                 # Check if processed in Step 1 (Holdings)
                 if ticker in processed_tickers:
                     continue
+
+                # Random Delay for Anti-Ban
+                time.sleep(random.uniform(2.0, 4.0))
 
                 # Step A: Analyze Technicals
                 metrics = analyze_technicals(ticker)
