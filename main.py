@@ -17,7 +17,6 @@ from google import genai
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
-MAX_ASSET_ALLOCATION = 0.20
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = "portfolio.json"
@@ -151,7 +150,8 @@ def get_ai_analysis(stock_metrics, purpose="BUY"):
             f"Respond strictly with a valid JSON object (no markdown) with these keys:\n"
             f"decision: 'BUY', 'SELL', or 'HOLD'\n"
             f"confidence: integer 0-100\n"
-            f"reason: Brief reason in Traditional Chinese (under 30 words)."
+            f"reason: Brief reason in Traditional Chinese (under 30 words).\n"
+            f"allocation_percent: float 0.01-1.00 (Percentage of available cash to invest)."
         )
 
         response = client.models.generate_content(
@@ -221,13 +221,9 @@ def process_sell_signals(portfolio):
 
 def process_buy_signals(portfolio, candidates):
     """
-    Checks top candidates using AI and Risk Management.
+    Checks top candidates using AI for dynamic position sizing.
     """
     print("Processing Buy Signals (Smart Mode)...")
-
-    # Calculate Total Portfolio Value for Risk Management
-    total_value, _, _ = calculate_portfolio_value(portfolio)
-    max_per_stock_value = total_value * MAX_ASSET_ALLOCATION
 
     for candidate in candidates:
         ticker = candidate['Ticker']
@@ -239,11 +235,22 @@ def process_buy_signals(portfolio, candidates):
         ai_decision = "HOLD"
         ai_confidence = 0
         ai_reason = "No AI Analysis"
+        ai_allocation = 0.10 # Default 10%
 
         if ai_result:
             ai_decision = ai_result.get("decision", "HOLD")
             ai_confidence = int(ai_result.get("confidence", 0))
             ai_reason = ai_result.get("reason", "N/A")
+            raw_allocation = ai_result.get("allocation_percent", 0.10)
+
+            # Sanitization & Clamping
+            try:
+                ai_allocation = float(raw_allocation)
+                if ai_allocation > 1.0:
+                    ai_allocation /= 100.0
+                ai_allocation = max(0.01, min(ai_allocation, 1.0))
+            except:
+                ai_allocation = 0.10
 
             # Store for notification
             candidate['AI_Decision'] = ai_decision
@@ -253,49 +260,41 @@ def process_buy_signals(portfolio, candidates):
         # Buy Condition: AI says BUY and Confidence > 75
         if ai_decision == "BUY" and ai_confidence > 75:
 
-            # 2. Risk Management (Allocation Check)
-            current_shares = portfolio['holdings'].get(ticker, 0)
-            current_holding_value = current_shares * price
+            # 2. Dynamic Position Sizing (Based on Remaining Cash)
+            current_cash = portfolio['balance']
+            invest_amount = current_cash * ai_allocation
 
-            remaining_allocation = max_per_stock_value - current_holding_value
+            # Calculate shares
+            shares_to_buy = int(invest_amount / price)
 
-            if remaining_allocation > 0:
-                # Calculate max shares we can buy within allocation
-                max_shares_risk = int(remaining_allocation / price)
+            # Round down to nearest 10 if possible, else 1
+            if shares_to_buy >= 10:
+                shares_to_buy = (shares_to_buy // 10) * 10
 
-                # Calculate max shares we can buy with cash
-                max_shares_cash = int(portfolio['balance'] / price)
+            cost = shares_to_buy * price
 
-                # We want to buy 1000 shares (standard lot) if possible, but limited by risk/cash
-                # Or just buy what we can fit?
-                # Let's target 1000 shares, but clip to limits.
-                target_shares = 1000
-                final_shares = min(target_shares, max_shares_risk, max_shares_cash)
+            # Final check on cash (rounding might have edge cases, though int() handles it mostly)
+            if shares_to_buy > 0 and portfolio['balance'] >= cost:
+                portfolio['balance'] -= cost
 
-                if final_shares > 0:
-                    cost = final_shares * price
-                    portfolio['balance'] -= cost
-
-                    if ticker in portfolio['holdings']:
-                        portfolio['holdings'][ticker] += final_shares
-                    else:
-                        portfolio['holdings'][ticker] = final_shares
-
-                    # Log
-                    log = {
-                        "action": "BUY",
-                        "ticker": ticker,
-                        "price": price,
-                        "shares": final_shares,
-                        "reason": f"AI: {ai_decision} ({ai_confidence}%)",
-                        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    portfolio['history'].append(log)
-                    print(f"BUY SIGNAL: Bought {ticker} ({final_shares} shares). Reason: {log['reason']}")
+                if ticker in portfolio['holdings']:
+                    portfolio['holdings'][ticker] += shares_to_buy
                 else:
-                    print(f"Skipped {ticker}: Allocation/Cash full (Risk Limit: ${max_per_stock_value:,.0f})")
+                    portfolio['holdings'][ticker] = shares_to_buy
+
+                # Log
+                log = {
+                    "action": "BUY",
+                    "ticker": ticker,
+                    "price": price,
+                    "shares": shares_to_buy,
+                    "reason": f"AI Decision: {ai_decision} (Confidence: {ai_confidence}%) | Allocating: {ai_allocation*100:.1f}% of Cash",
+                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                portfolio['history'].append(log)
+                print(f"BUY SIGNAL: Bought {ticker} ({shares_to_buy} shares). Reason: {log['reason']}")
             else:
-                print(f"Skipped {ticker}: Max Allocation Reached (${current_holding_value:,.0f})")
+                print(f"Skipped {ticker}: Insufficient Cash for AI allocation (${invest_amount:,.0f})")
         else:
             print(f"Skipped {ticker}: AI says {ai_decision} ({ai_confidence}%)")
 
@@ -730,6 +729,17 @@ def main():
         ai_decision = top_1_processed.get('AI_Decision', 'N/A')
         ai_conf = top_1_processed.get('AI_Confidence', 0)
         ai_reason = top_1_processed.get('AI_Reason', 'Analysis Pending')
+
+        # Determine allocation message if available
+        ai_alloc_msg = ""
+        if ai_decision == "BUY" and ai_conf > 75:
+             # Just a visual estimate, not the actual execution which depends on cash
+             # But we can show what the AI *wanted*
+             # Note: We didn't save the sanitized 'ai_allocation' back to the dict easily accessible here unless we stored it.
+             # We only stored Decision/Confidence/Reason.
+             # We can just say "Allocating: %" if we had it.
+             # Let's keep it simple: "AI Decision: BUY (Confidence: 85%)"
+             pass
 
         # Get list of top 3 tickers
         top_3_tickers = top_picks.head(3)['Name'].tolist()
