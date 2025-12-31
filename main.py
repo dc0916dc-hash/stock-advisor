@@ -43,6 +43,7 @@ MAX_POSITION_RATIO = 0.40
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = os.path.join(BASE_DIR, "portfolio.json")
+SAFE_ASSET_TICKER = "00878.TW"
 
 # Global State for Market Sentiment
 DAILY_MARKET_SENTIMENT = "Neutral"
@@ -60,10 +61,13 @@ BATTLEFIELD_TARGETS = [
     # Financials (Stability)
     "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2884.TW", "2892.TW", "2885.TW", "5880.TW", "2880.TW", "2890.TW",
     # High Volume / Popular / ETFs (Proxies)
-    "0050.TW", "0056.TW", "00878.TW", "00929.TW", "00919.TW",
+    "0050.TW", "0056.TW", "00929.TW", "00919.TW",
     "2344.TW", "2409.TW", "3481.TW", "2002.TW", "1101.TW", "2353.TW", "2327.TW", "2449.TW",
     "3017.TW", "3035.TW", "3044.TW", "2383.TW", "2363.TW", "2337.TW", "2492.TW", "3019.TW", "2408.TW"
 ]
+
+# De-duplicate just in case
+BATTLEFIELD_TARGETS = list(set(BATTLEFIELD_TARGETS))
 
 # Validate Keys
 if not DISCORD_WEBHOOK_URL:
@@ -195,32 +199,50 @@ def get_realtime_price(ticker):
 def load_portfolio():
     """
     Loads portfolio from JSON file or creates a default one if not exists.
-    Performs migration to rich format {ticker: {shares, cost, buy_reason}}.
+    Performs migration to rich format and segments Active/Safe holdings.
     """
     if os.path.exists(PORTFOLIO_FILE):
         try:
             with open(PORTFOLIO_FILE, 'r') as f:
                 portfolio = json.load(f)
 
-            # Migration Logic
             migrated = False
-            for ticker, data in portfolio['holdings'].items():
-                # Migration 1: int -> dict
+
+            # Migration 1: 'holdings' -> 'active_holdings'
+            if 'holdings' in portfolio and 'active_holdings' not in portfolio:
+                logging.info("Migrating 'holdings' to 'active_holdings'...")
+                portfolio['active_holdings'] = portfolio['holdings']
+                del portfolio['holdings']
+                portfolio['safe_holdings'] = {}
+                portfolio['initial_principal'] = INITIAL_CAPITAL
+                migrated = True
+
+            # Initialize Safe Holdings if missing
+            if 'safe_holdings' not in portfolio:
+                portfolio['safe_holdings'] = {}
+                migrated = True
+
+            # Initialize Initial Principal if missing
+            if 'initial_principal' not in portfolio:
+                portfolio['initial_principal'] = INITIAL_CAPITAL
+                migrated = True
+
+            # Data Integrity Check on Active Holdings
+            for ticker, data in portfolio['active_holdings'].items():
                 if isinstance(data, int):
                     logging.info(f"Migrating {ticker} to rich format...")
                     realtime_price = get_realtime_price(ticker)
                     cost_basis = realtime_price if realtime_price else 0.0
 
-                    portfolio['holdings'][ticker] = {
+                    portfolio['active_holdings'][ticker] = {
                         "shares": data,
                         "cost": cost_basis,
                         "buy_reason": "Legacy Position"
                     }
                     migrated = True
-                # Migration 2: dict missing buy_reason
                 elif isinstance(data, dict) and "buy_reason" not in data:
                     logging.info(f"Migrating {ticker} adding buy_reason...")
-                    portfolio['holdings'][ticker]["buy_reason"] = "Legacy Position"
+                    portfolio['active_holdings'][ticker]["buy_reason"] = "Legacy Position"
                     migrated = True
 
             if migrated:
@@ -234,9 +256,11 @@ def load_portfolio():
 
     # Default Portfolio
     return {
-        "balance": INITIAL_CAPITAL,  # Initial Capital from Constant
-        "holdings": {},     # {"Ticker": {"shares": int, "cost": float, "buy_reason": str}}
-        "history": []       # List of transaction logs
+        "balance": INITIAL_CAPITAL,
+        "initial_principal": INITIAL_CAPITAL,
+        "active_holdings": {},
+        "safe_holdings": {},
+        "history": []
     }
 
 def get_recent_performance_summary(portfolio, limit=5):
@@ -283,52 +307,160 @@ def save_portfolio(portfolio):
     with open(PORTFOLIO_FILE, 'w') as f:
         json.dump(portfolio, f, indent=4)
 
+def get_segment_values(portfolio):
+    """
+    Calculates the Market Value of Active and Safe segments.
+    Returns (active_total, safe_total, active_val, safe_val)
+    active_total = Cash + Active Holdings Value
+    safe_total = Safe Holdings Value
+    """
+    active_val = 0
+    safe_val = 0
+
+    # Calculate Active Holdings Value
+    for ticker, data in portfolio['active_holdings'].items():
+        shares = data['shares']
+        price = get_realtime_price(ticker)
+        if not price:
+            # Fallback
+            try:
+                price = yf.Ticker(ticker).history(period="1d")['Close'].iloc[-1]
+            except:
+                price = 0
+        active_val += shares * price
+
+    # Calculate Safe Holdings Value
+    for ticker, data in portfolio['safe_holdings'].items():
+        shares = data['shares']
+        price = get_realtime_price(ticker)
+        if not price:
+            try:
+                price = yf.Ticker(ticker).history(period="1d")['Close'].iloc[-1]
+            except:
+                price = 0
+        safe_val += shares * price
+
+    active_total = portfolio['balance'] + active_val
+    safe_total = safe_val
+
+    return active_total, safe_total, active_val, safe_val
+
+def rebalance_capital(portfolio):
+    """
+    Implements Profit Harvesting & Capital Protection Protocol.
+    Scenario A (Harvest): Active > 100k -> Buy 00878.
+    Scenario B (Rescue): Active < 100k & Safe > 0 -> Sell 00878.
+    """
+    logging.info("Checking for Capital Rebalancing...")
+    active_total, safe_total, _, _ = get_segment_values(portfolio)
+    initial_principal = portfolio.get('initial_principal', INITIAL_CAPITAL)
+
+    rebalanced = False
+
+    # Scenario A: Profit Harvesting
+    # Constraint: Harvest until Safe Bucket reaches Initial Principal (Phase 2)
+    # If safe_total >= initial_principal, we stop harvesting (Growth Phase)
+    if active_total > initial_principal and safe_total < initial_principal:
+        surplus = active_total - initial_principal
+        # Safety: Ensure surplus is significant enough to trade (e.g. > 1000 TWD)
+        if surplus > 1000:
+            price = get_realtime_price(SAFE_ASSET_TICKER)
+            if price:
+                # We need to spend 'surplus' from Cash.
+                # However, surplus includes Stock Value. We can only spend Cash.
+                # Max buy = portfolio['balance'].
+                # Invest Amount = min(surplus, portfolio['balance'])
+                invest_amount = min(surplus, portfolio['balance'])
+
+                # Further constraint: Keep a small buffer? No, aggressive harvest.
+                if invest_amount > price:
+                    shares_to_buy = int(invest_amount / price)
+                    if shares_to_buy > 0:
+                        gross_cost = shares_to_buy * price
+                        fee = calculate_transaction_fee(gross_cost)
+                        total_cost = gross_cost + fee
+
+                        if portfolio['balance'] >= total_cost:
+                            portfolio['balance'] -= total_cost
+
+                            # Update Safe Holdings
+                            current_data = portfolio['safe_holdings'].get(SAFE_ASSET_TICKER, {'shares': 0, 'cost': 0.0})
+                            old_shares = current_data['shares']
+                            old_cost = current_data['cost'] * old_shares
+
+                            new_shares = old_shares + shares_to_buy
+                            new_avg = (old_cost + total_cost) / new_shares
+
+                            portfolio['safe_holdings'][SAFE_ASSET_TICKER] = {
+                                "shares": new_shares,
+                                "cost": new_avg,
+                                "buy_reason": "Profit Harvesting"
+                            }
+
+                            logging.info(f"💰 HARVEST: Moved ${total_cost:,.0f} from Active to Safe ({shares_to_buy} shares of {SAFE_ASSET_TICKER}).")
+                            send_discord_notification(f"💰 **獲利收割 (Harvest)**: 移轉 ${total_cost:,.0f} 至避險資產 ({SAFE_ASSET_TICKER}).")
+                            rebalanced = True
+
+    # Scenario B: Capital Rescue
+    elif active_total < initial_principal and safe_total > 0:
+        deficit = initial_principal - active_total
+        if deficit > 1000: # Threshold
+            price = get_realtime_price(SAFE_ASSET_TICKER)
+            if price:
+                # Need to recover 'deficit' amount.
+                # Liquidity available = safe_total.
+                amount_to_liquidate = min(deficit, safe_total)
+                shares_to_sell = int(amount_to_liquidate / price)
+
+                current_shares = portfolio['safe_holdings'][SAFE_ASSET_TICKER]['shares']
+                shares_to_sell = min(shares_to_sell, current_shares)
+
+                if shares_to_sell > 0:
+                    gross_rev = shares_to_sell * price
+                    fee = calculate_transaction_fee(gross_rev)
+                    tax = calculate_tax(gross_rev)
+                    net_rev = gross_rev - fee - tax
+
+                    portfolio['balance'] += net_rev
+                    portfolio['safe_holdings'][SAFE_ASSET_TICKER]['shares'] -= shares_to_sell
+
+                    # Cleanup if 0
+                    if portfolio['safe_holdings'][SAFE_ASSET_TICKER]['shares'] == 0:
+                        del portfolio['safe_holdings'][SAFE_ASSET_TICKER]
+
+                    logging.info(f"🛡️ RESCUE: Liquidated ${net_rev:,.0f} from Safe to Active ({shares_to_sell} shares).")
+                    send_discord_notification(f"🛡️ **資金救援 (Rescue)**: 從避險資產贖回 ${net_rev:,.0f} 補充主力本金.")
+                    rebalanced = True
+
+    return portfolio
+
 def calculate_portfolio_value(portfolio):
     """
-    Calculates total portfolio value (Cash + Market Value of Holdings).
+    Calculates total portfolio value (Cash + Active + Safe).
     Returns (total_value, profit_loss_pct, details_str).
     """
-    total_value = portfolio['balance']
-    holdings_value = 0
+    active_total, safe_total, active_val, safe_val = get_segment_values(portfolio)
+    total_value = active_total + safe_total - portfolio['balance'] # Avoid double counting cash?
+    # Wait, active_total = Cash + Active_Val.
+    # Safe_total = Safe_Val.
+    # Total Equity = Cash + Active_Val + Safe_Val.
+    # So Total = active_total + safe_total. Correct.
+    total_value = portfolio['balance'] + active_val + safe_val
+
+    initial_principal = portfolio.get('initial_principal', INITIAL_CAPITAL)
+    pl_pct = ((total_value - initial_principal) / initial_principal) * 100
+
     details = []
+    # Active Details
+    for ticker, data in portfolio['active_holdings'].items():
+        details.append(f"{ticker}(A):{data['shares']}")
+    # Safe Details
+    for ticker, data in portfolio['safe_holdings'].items():
+        details.append(f"{ticker}(S):{data['shares']}")
 
-    for ticker, data in portfolio['holdings'].items():
-        # Handle both old (int) and new (dict) formats just in case, though migration should fix it
-        if isinstance(data, int):
-            shares = data
-            # cost = 0 # unknown
-        else:
-            shares = data['shares']
-            # cost = data['cost']
+    details_str = ", ".join(details) if details else "No Positions"
 
-        try:
-            # Use real-time price first
-            current_price = get_realtime_price(ticker)
-
-            if current_price:
-                value = current_price * shares
-                holdings_value += value
-                details.append(f"{ticker}: {shares}股 (${value:,.0f})")
-            else:
-                # Fallback to yfinance if realtime fails
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period="1d")
-                if not hist.empty:
-                    current_price = hist['Close'].iloc[-1]
-                    value = current_price * shares
-                    holdings_value += value
-                    details.append(f"{ticker}: {shares}股 (${value:,.0f})")
-                else:
-                    details.append(f"{ticker}: {shares}股 (No Data)")
-        except Exception:
-             details.append(f"{ticker}: {shares}股 (Error)")
-
-    total_value += holdings_value
-
-    initial_capital = INITIAL_CAPITAL
-    pl_pct = ((total_value - initial_capital) / initial_capital) * 100
-
-    return total_value, pl_pct, ", ".join(details)
+    return total_value, pl_pct, details_str
 
 def send_discord_notification(message):
     """
@@ -534,9 +666,10 @@ def manage_holdings(portfolio):
     Returns (portfolio, list_of_trade_messages, list_of_processed_tickers).
     """
     logging.info("Step 1: Managing Holdings...")
-    updated_holdings = portfolio['holdings'].copy()
+    updated_holdings = portfolio['active_holdings'].copy()
     trade_messages = []
     processed_tickers = []
+    has_sold = False
 
     # Calculate Total Portfolio Value for Risk Management (used in ADD)
     total_asset_value, _, _ = calculate_portfolio_value(portfolio)
@@ -544,7 +677,7 @@ def manage_holdings(portfolio):
     # Get History Summary
     history_summary = get_recent_performance_summary(portfolio)
 
-    for ticker, data in portfolio['holdings'].items():
+    for ticker, data in portfolio['active_holdings'].items():
         processed_tickers.append(ticker)
 
         # Random Delay for Anti-Ban
@@ -620,6 +753,7 @@ def manage_holdings(portfolio):
 
                 portfolio['balance'] += net_revenue
                 del updated_holdings[ticker]
+                has_sold = True
 
                 # Log History with Feedback Data
                 log = {
@@ -658,6 +792,7 @@ def manage_holdings(portfolio):
 
                     portfolio['balance'] += net_revenue
                     updated_holdings[ticker]['shares'] -= shares_to_sell
+                    has_sold = True
 
                     if updated_holdings[ticker]['shares'] == 0:
                         del updated_holdings[ticker] # Fully reduced?
@@ -735,7 +870,12 @@ def manage_holdings(portfolio):
         except Exception as e:
             logging.error(f"Error managing holding {ticker}: {e}")
 
-    portfolio['holdings'] = updated_holdings
+    portfolio['active_holdings'] = updated_holdings
+
+    # Trigger Rebalance if we sold anything
+    if has_sold:
+        portfolio = rebalance_capital(portfolio)
+
     return portfolio, trade_messages, processed_tickers
 
 def process_buy_signals(portfolio, candidates):
@@ -825,7 +965,7 @@ def process_buy_signals(portfolio, candidates):
                 # Unit cost = Total Cost / Shares
                 avg_cost = total_cost / shares_to_buy
 
-                portfolio['holdings'][ticker] = {
+                portfolio['active_holdings'][ticker] = {
                     "shares": shares_to_buy,
                     "cost": avg_cost,
                     "buy_reason": ai_reason
@@ -1185,6 +1325,11 @@ def main():
 
                     # Close Briefing
                     end_portfolio = load_portfolio()
+
+                    # Run Capital Rebalancing at Close
+                    end_portfolio = rebalance_capital(end_portfolio)
+                    save_portfolio(end_portfolio)
+
                     current_equity, _, _ = calculate_portfolio_value(end_portfolio)
                     pnl_val = current_equity - session_start_equity
                     pnl_pct = 0
