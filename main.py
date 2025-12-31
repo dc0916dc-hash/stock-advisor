@@ -17,10 +17,13 @@ INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Validate Keys
 if not DISCORD_WEBHOOK_URL:
     raise ValueError("Missing Environment Variable: DISCORD_WEBHOOK_URL. Please set this in GitHub Secrets.")
+if not GEMINI_API_KEY:
+    raise ValueError("Missing Environment Variable: GEMINI_API_KEY. Please set this in GitHub Secrets.")
 
 def get_stock_name_cn(ticker):
     """
@@ -56,8 +59,7 @@ def get_ai_commentary(stock_metrics):
     """
     print(f"Generating AI Commentary for {stock_metrics['Name']}...")
     try:
-        # client automatically detects GEMINI_API_KEY from environment variables
-        client = genai.Client()
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
         prompt = (
             f"You are a professional Taiwan stock analyst. "
