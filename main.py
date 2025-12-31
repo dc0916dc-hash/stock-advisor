@@ -17,7 +17,7 @@ from google import genai
 
 # Constants
 INITIAL_CAPITAL = 100000
-TARGET_ANNUAL_RETURN = 0.15
+TARGET_MONTHLY_RETURN = 0.20
 TEST_MODE = True
 INTRADAY_MODE = True
 MAX_POSITION_RATIO = 0.40
@@ -112,29 +112,32 @@ def get_realtime_price(ticker):
 def load_portfolio():
     """
     Loads portfolio from JSON file or creates a default one if not exists.
-    Performs migration from old format {ticker: shares} to new format {ticker: {shares, cost}}.
+    Performs migration to rich format {ticker: {shares, cost, buy_reason}}.
     """
     if os.path.exists(PORTFOLIO_FILE):
         try:
             with open(PORTFOLIO_FILE, 'r') as f:
                 portfolio = json.load(f)
 
-            # Migration Logic: Convert simple holdings to rich holdings
+            # Migration Logic
             migrated = False
             for ticker, data in portfolio['holdings'].items():
-                if isinstance(data, int): # Old format
+                # Migration 1: int -> dict
+                if isinstance(data, int):
                     print(f"Migrating {ticker} to rich format...")
                     realtime_price = get_realtime_price(ticker)
-                    # If fetch fails, use 0.0 or last close from yfinance?
-                    # User approved: "default to current market price".
-                    # If realtime fails, we can try yfinance history in analyze, but here we need it fast.
-                    # Fallback to 0 if absolutely no data, but let's try.
                     cost_basis = realtime_price if realtime_price else 0.0
 
                     portfolio['holdings'][ticker] = {
                         "shares": data,
-                        "cost": cost_basis
+                        "cost": cost_basis,
+                        "buy_reason": "Legacy Position"
                     }
+                    migrated = True
+                # Migration 2: dict missing buy_reason
+                elif isinstance(data, dict) and "buy_reason" not in data:
+                    print(f"Migrating {ticker} adding buy_reason...")
+                    portfolio['holdings'][ticker]["buy_reason"] = "Legacy Position"
                     migrated = True
 
             if migrated:
@@ -149,9 +152,40 @@ def load_portfolio():
     # Default Portfolio
     return {
         "balance": INITIAL_CAPITAL,  # Initial Capital from Constant
-        "holdings": {},     # {"Ticker": {"shares": int, "cost": float}}
+        "holdings": {},     # {"Ticker": {"shares": int, "cost": float, "buy_reason": str}}
         "history": []       # List of transaction logs
     }
+
+def get_recent_performance_summary(portfolio, limit=5):
+    """
+    Generates a summary string of recent closed trades for AI context.
+    """
+    summary = []
+    closed_trades = [
+        log for log in portfolio['history']
+        if log['action'] in ["SELL", "CLEAR", "REDUCE"]
+    ]
+
+    # Get last N trades (reverse order)
+    recent = closed_trades[-limit:]
+
+    for i, trade in enumerate(reversed(recent), 1):
+        ticker = trade.get('ticker', 'Unknown')
+        pnl = trade.get('pnl_percentage', 0.0)
+        buy_reason = trade.get('buy_reason', 'N/A')
+        sell_reason = trade.get('reason', 'N/A')
+
+        result = "WIN" if pnl > 0 else "LOSS"
+        summary.append(
+            f"{i}. {ticker} ({result} {pnl:+.2f}%)\n"
+            f"   - Buy Reason: {buy_reason}\n"
+            f"   - Sell Reason: {sell_reason}"
+        )
+
+    if not summary:
+        return "No recent closed trades."
+
+    return "\n".join(summary)
 
 def save_portfolio(portfolio):
     """
@@ -237,17 +271,29 @@ def parse_ai_json(response_text):
         return None
 
 @with_retry()
-def get_ai_analysis(stock_metrics, context=None):
+def get_ai_analysis(stock_metrics, context=None, history_summary=""):
     """
-    Uses Gemini 2.5 Flash to generate a JSON decision.
+    Uses Gemini 2.5 Flash to generate a JSON decision with Self-Learning context.
     Context: Optional dictionary with 'cost', 'profit_pct', 'shares' for existing holdings.
+    history_summary: String summary of recent trade performance for in-context learning.
     """
     print(f"Requesting AI Analysis for {stock_metrics['Name']}...")
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
 
+        # Learning Section
+        learning_str = ""
+        if history_summary:
+            learning_str = (
+                f"🔍 SELF-REFLECTION & LEARNING:\n"
+                f"Review your recent trade history below. Identify patterns in your Wins and Losses.\n"
+                f"Instruction: If recent trades are losing, tighten criteria. If winning, apply successful patterns.\n"
+                f"{history_summary}\n\n"
+            )
+
         # Base Data
         data_str = (
+            f"{learning_str}"
             f"Analyze this data for {stock_metrics['Name']} ({stock_metrics['Ticker']}):\n"
             f"Price: {stock_metrics['Price']}\n"
             f"Trend Score: {stock_metrics['Trend_Score']:.2f}\n"
@@ -263,6 +309,7 @@ def get_ai_analysis(stock_metrics, context=None):
                 f"Avg Cost: {context['cost']}\n"
                 f"Current Profit/Loss: {context['profit_pct']:.2f}%\n"
                 f"Quantity Held: {context['shares']}\n"
+                f"Buy Reason: {context.get('buy_reason', 'N/A')}\n"
                 f"Task: Decide whether to INCREASE position (ADD), DECREASE position (REDUCE), EXIT (CLEAR), or HOLD.\n"
             )
             json_req = (
@@ -278,7 +325,8 @@ def get_ai_analysis(stock_metrics, context=None):
             )
 
         prompt = (
-            f"You are a professional fund manager trading Taiwan stocks. "
+            f"You are an aggressive growth fund manager. Your goal is to achieve a 20% Monthly Return. "
+            f"Prioritize High Momentum, Volatility, and Short-term Catalysts. Accept higher risks for higher rewards.\n"
             f"{data_str}"
             f"Respond strictly with a valid JSON object (no markdown) with these keys:\n"
             f"{json_req}"
@@ -312,6 +360,9 @@ def manage_holdings(portfolio):
     # Calculate Total Portfolio Value for Risk Management (used in ADD)
     total_asset_value, _, _ = calculate_portfolio_value(portfolio)
 
+    # Get History Summary
+    history_summary = get_recent_performance_summary(portfolio)
+
     for ticker, data in portfolio['holdings'].items():
         processed_tickers.append(ticker)
 
@@ -322,9 +373,11 @@ def manage_holdings(portfolio):
         if isinstance(data, int):
             shares = data
             avg_cost = 0.0
+            buy_reason = "Legacy"
         else:
             shares = data['shares']
             avg_cost = data.get('cost', 0.0)
+            buy_reason = data.get('buy_reason', 'N/A')
 
         try:
             metrics = analyze_technicals(ticker)
@@ -343,21 +396,29 @@ def manage_holdings(portfolio):
             context = {
                 "cost": avg_cost,
                 "profit_pct": profit_pct,
-                "shares": shares
+                "shares": shares,
+                "buy_reason": buy_reason
             }
 
             # AI Decision
-            ai_result = get_ai_analysis(metrics, context=context)
+            ai_result = get_ai_analysis(metrics, context=context, history_summary=history_summary)
             action = "HOLD"
+            confidence = 0
             percentage = 0.0
             reason = "N/A"
 
             if ai_result:
                 action = ai_result.get("action", "HOLD")
+                confidence = int(ai_result.get("confidence", 0))
                 percentage = float(ai_result.get("percentage", 0.0))
                 reason = ai_result.get("reason", "N/A")
 
             # --- EXECUTION LOGIC ---
+
+            # Enforce Confidence on ADD (Aggressive but conviction required)
+            if action == "ADD" and confidence <= 75:
+                print(f"Skipping ADD for {ticker}: Low Confidence ({confidence}%)")
+                action = "HOLD"
 
             # CLEAR (Sell All)
             if action == "CLEAR":
@@ -368,6 +429,23 @@ def manage_holdings(portfolio):
 
                 portfolio['balance'] += net_revenue
                 del updated_holdings[ticker]
+
+                # Log History with Feedback Data
+                log = {
+                    "action": "CLEAR",
+                    "ticker": ticker,
+                    "price": exec_price,
+                    "shares": shares,
+                    "pnl_percentage": profit_pct,
+                    "buy_reason": buy_reason,
+                    "reason": reason, # Sell Reason
+                    "indicators": {
+                        "RSI": round(metrics['RSI'], 2),
+                        "Trend": round(metrics['Trend_Score'], 2)
+                    },
+                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                portfolio['history'].append(log)
 
                 msg = f"🔴 **CLEAR**: {ticker} (All {shares} shares) @ {exec_price} | Net: ${net_revenue:,.0f} (Fee: {fee}, Tax: {tax}) | P/L: {profit_pct:.2f}% | {reason}"
                 trade_messages.append(msg)
@@ -389,6 +467,23 @@ def manage_holdings(portfolio):
 
                     if updated_holdings[ticker]['shares'] == 0:
                         del updated_holdings[ticker] # Fully reduced?
+
+                    # Log
+                    log = {
+                        "action": "REDUCE",
+                        "ticker": ticker,
+                        "price": exec_price,
+                        "shares": shares_to_sell,
+                        "pnl_percentage": profit_pct, # Snapshot of current P/L
+                        "buy_reason": buy_reason,
+                        "reason": reason,
+                        "indicators": {
+                            "RSI": round(metrics['RSI'], 2),
+                            "Trend": round(metrics['Trend_Score'], 2)
+                        },
+                        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    portfolio['history'].append(log)
 
                     msg = f"🟠 **REDUCE**: {ticker} ({shares_to_sell} shares) @ {exec_price} | Net: ${net_revenue:,.0f} | {reason}"
                     trade_messages.append(msg)
@@ -457,6 +552,9 @@ def process_buy_signals(portfolio, candidates):
     # Calculate Total Value for 40% Cap
     total_asset_value, _, _ = calculate_portfolio_value(portfolio)
 
+    # Get History Summary for Feedback Loop
+    history_summary = get_recent_performance_summary(portfolio)
+
     for candidate in candidates:
         ticker = candidate['Ticker']
 
@@ -468,14 +566,16 @@ def process_buy_signals(portfolio, candidates):
         exec_price = realtime_price if realtime_price else candidate['Price']
 
         # 1. AI Analysis
-        ai_result = get_ai_analysis(candidate)
+        ai_result = get_ai_analysis(candidate, history_summary=history_summary)
 
         ai_action = "HOLD"
+        ai_confidence = 0
         ai_percentage = 0.10
         ai_reason = "N/A"
 
         if ai_result:
             ai_action = ai_result.get("action", "HOLD")
+            ai_confidence = int(ai_result.get("confidence", 0))
             ai_percentage = float(ai_result.get("percentage", 0.10))
             ai_reason = ai_result.get("reason", "N/A")
 
@@ -487,8 +587,8 @@ def process_buy_signals(portfolio, candidates):
             candidate['AI_Decision'] = ai_action
             candidate['AI_Reason'] = ai_reason
 
-        # Buy Condition: Action is BUY
-        if ai_action == "BUY":
+        # Buy Condition: Action is BUY AND Confidence > 75 (Gatekeeper)
+        if ai_action == "BUY" and ai_confidence > 75:
 
             # 2. Position Sizing
             invest_amount = portfolio['balance'] * ai_percentage
@@ -522,7 +622,8 @@ def process_buy_signals(portfolio, candidates):
 
                 portfolio['holdings'][ticker] = {
                     "shares": shares_to_buy,
-                    "cost": avg_cost
+                    "cost": avg_cost,
+                    "buy_reason": ai_reason
                 }
 
                 reason_str = f"AI: {ai_action} | Alloc: {ai_percentage*100:.1f}% | {ai_reason}"
@@ -544,7 +645,7 @@ def process_buy_signals(portfolio, candidates):
             else:
                 print(f"Skipped {ticker}: Insufficient Cash/Allocation (${invest_amount:,.0f})")
         else:
-            print(f"Skipped {ticker}: AI says {ai_action}")
+            print(f"Skipped {ticker}: AI says {ai_action} (Confidence: {ai_confidence}%)")
 
     return portfolio, trade_messages
 
@@ -622,7 +723,7 @@ def analyze_technicals(ticker):
         'ATR': 0.0,
         'Trailing_Exit_Price': 0.0,
         'Trend_Score': 0.0,
-        'Past_Year_Return': 0.0,
+        'Past_Month_Return': 0.0,
         'Pass_Technical': False,
         'Pass_Performance': False,
         'Error': None
@@ -673,22 +774,22 @@ def analyze_technicals(ticker):
         # Trend Score: ((Close - SMA60) / SMA60) * 100
         metrics['Trend_Score'] = ((current_close - metrics['SMA60']) / metrics['SMA60']) * 100
 
-        # Past Year Return
-        # We need the price from roughly 1 year ago (252 trading days)
-        if len(df) > 252:
-            price_1y_ago = df['Close'].iloc[-252]
-            metrics['Past_Year_Return'] = (current_close - price_1y_ago) / price_1y_ago
+        # Past Month Return (Aggressive Growth)
+        # We need the price from roughly 1 month ago (21 trading days)
+        if len(df) > 21:
+            price_1m_ago = df['Close'].iloc[-21]
+            metrics['Past_Month_Return'] = (current_close - price_1m_ago) / price_1m_ago
         else:
-            # If less than a year, use the earliest available
+            # If less than a month, use the earliest available
             price_start = df['Close'].iloc[0]
-            metrics['Past_Year_Return'] = (current_close - price_start) / price_start
+            metrics['Past_Month_Return'] = (current_close - price_start) / price_start
 
         # Technical Filter: Price > SMA20 > SMA60 (Bullish alignment) AND RSI < 85
         if (current_close > metrics['SMA20'] > metrics['SMA60']) and (metrics['RSI'] < 85):
             metrics['Pass_Technical'] = True
 
-        # Performance Filter: Past_Year_Return >= TARGET_ANNUAL_RETURN
-        if metrics['Past_Year_Return'] >= TARGET_ANNUAL_RETURN:
+        # Performance Filter: Past_Month_Return >= TARGET_MONTHLY_RETURN
+        if metrics['Past_Month_Return'] >= TARGET_MONTHLY_RETURN:
             metrics['Pass_Performance'] = True
 
         return metrics
@@ -794,7 +895,7 @@ def get_news_sentiment(ticker):
 def main():
     print("Starting Stock Analysis Tool...")
     if INTRADAY_MODE:
-        send_discord_notification("🟢 **Bot Started**: 盤中監控模式已啟動 (每 5 分鐘掃描一次)")
+        send_discord_notification("🟢 **Bot Started**: 盤中監控模式已啟動 (每 5 分鐘掃描一次)\n🚀 目標策略：月報酬 20% (高風險高報酬模式)")
 
     # Main Intraday Loop
     while True:
