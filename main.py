@@ -17,6 +17,7 @@ from google import genai
 INITIAL_CAPITAL = 1000000
 TARGET_ANNUAL_RETURN = 0.15
 TEST_MODE = True
+MAX_ASSET_ALLOCATION = 0.20
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = "portfolio.json"
@@ -115,23 +116,42 @@ def send_discord_notification(message):
     except Exception as e:
         print(f"Error sending Discord notification: {e}")
 
-def get_ai_commentary(stock_metrics):
+def parse_ai_json(response_text):
     """
-    Uses Gemini 2.5 Flash to generate a brief buy recommendation in Traditional Chinese.
+    Parses JSON from Gemini response, handling markdown code blocks.
     """
-    print(f"Generating AI Commentary for {stock_metrics['Name']}...")
+    try:
+        clean_text = response_text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+        return json.loads(clean_text.strip())
+    except Exception as e:
+        print(f"JSON Parse Error: {e}")
+        return None
+
+def get_ai_analysis(stock_metrics, purpose="BUY"):
+    """
+    Uses Gemini 2.5 Flash to generate a JSON decision.
+    Purpose: "BUY" (for candidates) or "SELL" (for holdings).
+    """
+    print(f"Requesting AI Decision for {stock_metrics['Name']} ({purpose})...")
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
 
         prompt = (
-            f"You are a professional Taiwan stock analyst. "
-            f"Analyze these technicals and chips data for {stock_metrics['Name']} ({stock_metrics['Ticker']}):\n"
+            f"You are a professional fund manager trading Taiwan stocks. "
+            f"Analyze this data for {stock_metrics['Name']} ({stock_metrics['Ticker']}) to make a {purpose} decision:\n"
             f"Price: {stock_metrics['Price']}\n"
             f"Trend Score: {stock_metrics['Trend_Score']:.2f}\n"
             f"RSI: {stock_metrics['RSI']:.2f}\n"
             f"Foreign Net Buy: {stock_metrics['Foreign_Buy']}\n"
             f"News Sentiment: {stock_metrics['News_Sentiment_Score']:.2f}\n"
-            f"Write a concise buy recommendation in Traditional Chinese (under 50 words)."
+            f"Respond strictly with a valid JSON object (no markdown) with these keys:\n"
+            f"decision: 'BUY', 'SELL', or 'HOLD'\n"
+            f"confidence: integer 0-100\n"
+            f"reason: Brief reason in Traditional Chinese (under 30 words)."
         )
 
         response = client.models.generate_content(
@@ -140,12 +160,12 @@ def get_ai_commentary(stock_metrics):
         )
 
         if response.text:
-            return response.text.strip()
-        return "AI Analysis Unavailable."
+            return parse_ai_json(response.text)
+        return None
 
     except Exception as e:
         print(f"Gemini AI Error: {e}")
-        return "AI Analysis Failed (Check API Key)."
+        return None
 
 def process_sell_signals(portfolio):
     """
@@ -156,12 +176,26 @@ def process_sell_signals(portfolio):
 
     for ticker, shares in portfolio['holdings'].items():
         try:
-            # We need to analyze the stock again to get the Trend_Score
-            # This fetches history again. Optimized? Maybe, but safe.
+            # We need to analyze the stock again to get the Trend_Score and AI check
             metrics = analyze_technicals(ticker)
+            metrics['Name'] = get_stock_name_cn(ticker) # Fetch name for AI
 
-            # Sell Condition: Trend Score < 0
-            if metrics['Trend_Score'] < 0:
+            # 1. Technical Sell Check
+            tech_sell = metrics['Trend_Score'] < -5 # Hard Stop if Trend crashes
+
+            # 2. AI Sell Check
+            ai_sell = False
+            ai_reason = "Technical Stop"
+
+            ai_result = get_ai_analysis(metrics, purpose="SELL")
+            if ai_result:
+                decision = ai_result.get("decision", "HOLD")
+                if decision == "SELL":
+                    ai_sell = True
+                    ai_reason = f"AI: {ai_result.get('reason', 'Sell')}"
+
+            # Execute Sell if EITHER condition is true
+            if tech_sell or ai_sell:
                 current_price = metrics['Price']
                 revenue = current_price * shares
                 portfolio['balance'] += revenue
@@ -173,10 +207,11 @@ def process_sell_signals(portfolio):
                     "ticker": ticker,
                     "price": current_price,
                     "shares": shares,
+                    "reason": ai_reason if ai_sell else "Trend Score < -5",
                     "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 portfolio['history'].append(log)
-                print(f"SELL SIGNAL: Sold {ticker} ({shares} shares) at {current_price}")
+                print(f"SELL SIGNAL: Sold {ticker} ({shares} shares). Reason: {log['reason']}")
 
         except Exception as e:
             print(f"Error checking sell signal for {ticker}: {e}")
@@ -186,42 +221,83 @@ def process_sell_signals(portfolio):
 
 def process_buy_signals(portfolio, candidates):
     """
-    Checks top candidates for buy signals (Trend_Score > 3) and executes buy if cash allows.
-    Buys fixed 1000 shares (1 sheet) per signal for simplicity as per requirements.
+    Checks top candidates using AI and Risk Management.
     """
-    print("Processing Buy Signals...")
+    print("Processing Buy Signals (Smart Mode)...")
+
+    # Calculate Total Portfolio Value for Risk Management
+    total_value, _, _ = calculate_portfolio_value(portfolio)
+    max_per_stock_value = total_value * MAX_ASSET_ALLOCATION
 
     for candidate in candidates:
         ticker = candidate['Ticker']
         price = candidate['Price']
-        score = candidate['Trend_Score']
 
-        # Buy Condition: Trend Score > 3
-        if score > 3:
-            cost = price * 1000
+        # 1. AI Analysis
+        ai_result = get_ai_analysis(candidate, purpose="BUY")
 
-            # Check Cash
-            if portfolio['balance'] >= cost:
-                portfolio['balance'] -= cost
+        ai_decision = "HOLD"
+        ai_confidence = 0
+        ai_reason = "No AI Analysis"
 
-                # Add to holdings
-                if ticker in portfolio['holdings']:
-                    portfolio['holdings'][ticker] += 1000
+        if ai_result:
+            ai_decision = ai_result.get("decision", "HOLD")
+            ai_confidence = int(ai_result.get("confidence", 0))
+            ai_reason = ai_result.get("reason", "N/A")
+
+            # Store for notification
+            candidate['AI_Decision'] = ai_decision
+            candidate['AI_Confidence'] = ai_confidence
+            candidate['AI_Reason'] = ai_reason
+
+        # Buy Condition: AI says BUY and Confidence > 75
+        if ai_decision == "BUY" and ai_confidence > 75:
+
+            # 2. Risk Management (Allocation Check)
+            current_shares = portfolio['holdings'].get(ticker, 0)
+            current_holding_value = current_shares * price
+
+            remaining_allocation = max_per_stock_value - current_holding_value
+
+            if remaining_allocation > 0:
+                # Calculate max shares we can buy within allocation
+                max_shares_risk = int(remaining_allocation / price)
+
+                # Calculate max shares we can buy with cash
+                max_shares_cash = int(portfolio['balance'] / price)
+
+                # We want to buy 1000 shares (standard lot) if possible, but limited by risk/cash
+                # Or just buy what we can fit?
+                # Let's target 1000 shares, but clip to limits.
+                target_shares = 1000
+                final_shares = min(target_shares, max_shares_risk, max_shares_cash)
+
+                if final_shares > 0:
+                    cost = final_shares * price
+                    portfolio['balance'] -= cost
+
+                    if ticker in portfolio['holdings']:
+                        portfolio['holdings'][ticker] += final_shares
+                    else:
+                        portfolio['holdings'][ticker] = final_shares
+
+                    # Log
+                    log = {
+                        "action": "BUY",
+                        "ticker": ticker,
+                        "price": price,
+                        "shares": final_shares,
+                        "reason": f"AI: {ai_decision} ({ai_confidence}%)",
+                        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    portfolio['history'].append(log)
+                    print(f"BUY SIGNAL: Bought {ticker} ({final_shares} shares). Reason: {log['reason']}")
                 else:
-                    portfolio['holdings'][ticker] = 1000
-
-                # Log
-                log = {
-                    "action": "BUY",
-                    "ticker": ticker,
-                    "price": price,
-                    "shares": 1000,
-                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                portfolio['history'].append(log)
-                print(f"BUY SIGNAL: Bought {ticker} (1000 shares) at {price}")
+                    print(f"Skipped {ticker}: Allocation/Cash full (Risk Limit: ${max_per_stock_value:,.0f})")
             else:
-                print(f"Insufficient Cash to buy {ticker} (Cost: {cost})")
+                print(f"Skipped {ticker}: Max Allocation Reached (${current_holding_value:,.0f})")
+        else:
+            print(f"Skipped {ticker}: AI says {ai_decision} ({ai_confidence}%)")
 
     return portfolio
 
@@ -638,12 +714,25 @@ def main():
         top_1_ticker = top_1_data['Ticker']
         top_1_price = top_1_data['Price']
 
-        # AI Analysis for Top 1
-        ai_comment = get_ai_commentary(top_1_data)
-        print(f"AI Commentary: {ai_comment}")
+        # AI Analysis for Top 1 is already done in process_buy_signals logic usually,
+        # but here we display the Top 1 regardless of whether we bought it.
+        # If we didn't run buy logic (e.g. market bear), we don't have it.
+        # But we are in the "Bullish" block here.
+
+        # We need to fetch AI analysis if not present (process_buy_signals runs it)
+        # top_picks is a DataFrame, convert to dict for checking
+        # But wait, we passed 'top_candidates_list' to process_buy_signals which modified the dicts in place.
+        # The 'top_picks' DataFrame was created BEFORE process_buy_signals.
+
+        # Simpler: Just get the AI result from the list we processed
+        top_1_processed = top_candidates_list[0]
+
+        ai_decision = top_1_processed.get('AI_Decision', 'N/A')
+        ai_conf = top_1_processed.get('AI_Confidence', 0)
+        ai_reason = top_1_processed.get('AI_Reason', 'Analysis Pending')
 
         # Get list of top 3 tickers
-        top_3_tickers = top_picks.head(3)['Name'].tolist() # Using Name is better
+        top_3_tickers = top_picks.head(3)['Name'].tolist()
         top_3_str = ", ".join([str(x) for x in top_3_tickers])
 
         # Calculate Value for notification
@@ -655,8 +744,8 @@ def main():
             f"選出強勢股：**[{top_3_str}]**\n"
             f"🔥 冠軍股：**{top_1_name} ({top_1_ticker})**\n"
             f"💰 收盤價：{top_1_price}\n"
-            f"> 💡 **Gemini 觀點：**\n"
-            f"> {ai_comment}\n\n"
+            f"> 🤖 **AI 決策：** {ai_decision} (信心: {ai_conf}%)\n"
+            f"> 💡 **分析理由：** {ai_reason}\n\n"
             f"**📊 模擬帳戶 (Paper Trading)**\n"
             f"資產總值: ${total_val:,.0f} (P/L: {pl_pct:.2f}%)\n"
             f"現金: ${portfolio['balance']:,.0f}\n"
