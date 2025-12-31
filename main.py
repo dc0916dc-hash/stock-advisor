@@ -18,20 +18,29 @@ from google import genai
 # Constants
 INITIAL_CAPITAL = 100000
 TARGET_MONTHLY_RETURN = 0.20
-TEST_MODE = True
+TEST_MODE = False
 INTRADAY_MODE = True
 MAX_POSITION_RATIO = 0.40
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = "portfolio.json"
 
-# TW50 Candidates for Intraday Scanning (Top 50 by Cap/Volume)
-TW50_CANDIDATES = [
-    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2303.TW", "2881.TW", "2882.TW", "2886.TW", "2891.TW", "2884.TW",
-    "2002.TW", "1216.TW", "2412.TW", "2382.TW", "2892.TW", "2880.TW", "2885.TW", "3008.TW", "2357.TW", "2890.TW",
-    "1101.TW", "3045.TW", "2883.TW", "2887.TW", "3711.TW", "2327.TW", "3034.TW", "2912.TW", "2345.TW", "2408.TW",
-    "3037.TW", "2379.TW", "5880.TW", "1301.TW", "1303.TW", "1326.TW", "1402.TW", "2395.TW", "2603.TW", "2609.TW",
-    "2615.TW", "4904.TW", "4938.TW", "5871.TW", "5876.TW", "6505.TW", "6669.TW", "9910.TW"
+# Battlefield Targets (High Volume / Momentum)
+BATTLEFIELD_TARGETS = [
+    # Semis & Tech (The Core)
+    "2330.TW", "2454.TW", "2317.TW", "2308.TW", "2303.TW", "3711.TW", "3034.TW", "3037.TW", "2379.TW", "3008.TW",
+    # AI Server & Hardware (High Momentum)
+    "3231.TW", "2382.TW", "6669.TW", "2356.TW", "2376.TW", "2357.TW", "2301.TW", "2324.TW", "2421.TW", "2368.TW",
+    # Power & Energy (Policy Plays)
+    "1513.TW", "1519.TW", "1503.TW", "1504.TW", "1609.TW", "6806.TW",
+    # Shipping (Volatility Kings)
+    "2603.TW", "2609.TW", "2615.TW", "2618.TW", "2610.TW", "2606.TW",
+    # Financials (Stability)
+    "2881.TW", "2882.TW", "2891.TW", "2886.TW", "2884.TW", "2892.TW", "2885.TW", "5880.TW", "2880.TW", "2890.TW",
+    # High Volume / Popular / ETFs (Proxies)
+    "0050.TW", "0056.TW", "00878.TW", "00929.TW", "00919.TW",
+    "2344.TW", "2409.TW", "3481.TW", "2002.TW", "1101.TW", "2353.TW", "2327.TW", "2449.TW",
+    "3017.TW", "3035.TW", "3044.TW", "2383.TW", "2363.TW", "2337.TW", "2492.TW", "3019.TW", "2408.TW"
 ]
 
 # Validate Keys
@@ -710,28 +719,10 @@ def check_market_status():
 
 def get_stock_list():
     """
-    Generates a list of Taiwan stock tickers with appropriate suffixes (.TW or .TWO).
+    Returns the curated Battlefield Targets list for production.
     """
-    print("Generating stock list...")
-    tickers = []
-
-    # Iterate through all codes in twstock
-    for code, info in twstock.codes.items():
-        # specific to '股票' (stocks) and exclude warrants/others if possible
-        # twstock type: '股票', 'ETF', etc.
-        if info.type == '股票':
-            if info.market == '上市':
-                tickers.append(f"{code}.TW")
-            elif info.market == '上櫃':
-                tickers.append(f"{code}.TWO")
-
-    print(f"Total stocks found: {len(tickers)}")
-
-    if TEST_MODE:
-        print(f"TEST_MODE is ON. Slicing to top 50 stocks.")
-        return tickers[:50]
-
-    return tickers
+    print("Loading Battlefield Targets...")
+    return BATTLEFIELD_TARGETS
 
 @with_retry()
 def analyze_technicals(ticker):
@@ -1025,13 +1016,12 @@ def main():
             all_results = []
             candidates = []
 
-            # Step 2: Scan (Use TW50 subset for intraday speed)
+            # Step 2: Scan (Use Battlefield Targets)
             print("Step 2: Technical & Performance Scan (Candidates)")
 
-            scan_list = stocks
-            if INTRADAY_MODE:
-                scan_list = TW50_CANDIDATES
-                print(f"Intraday Mode: Scanning Top {len(scan_list)} stocks only.")
+            # Shuffle for fairness in latency
+            scan_list = list(stocks)
+            random.shuffle(scan_list)
 
             for ticker in tqdm(scan_list):
                 # Check if processed in Step 1 (Holdings)
