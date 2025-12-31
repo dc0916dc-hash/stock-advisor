@@ -13,7 +13,25 @@ import os
 import json
 import random
 import time
+import logging
 from google import genai
+from dotenv import load_dotenv
+
+# Setup Logging
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(BASE_DIR, 'bot_activity.log'), encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Load Environment Variables from .env in BASE_DIR
+load_dotenv(os.path.join(BASE_DIR, '.env'))
+
+logging.info(f"🚀 Bot starting in Production Mode. Watched Directory: {BASE_DIR}")
 
 # Constants
 INITIAL_CAPITAL = 100000
@@ -23,7 +41,7 @@ INTRADAY_MODE = True
 MAX_POSITION_RATIO = 0.40
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-PORTFOLIO_FILE = "portfolio.json"
+PORTFOLIO_FILE = os.path.join(BASE_DIR, "portfolio.json")
 
 # Battlefield Targets (High Volume / Momentum)
 BATTLEFIELD_TARGETS = [
@@ -45,9 +63,11 @@ BATTLEFIELD_TARGETS = [
 
 # Validate Keys
 if not DISCORD_WEBHOOK_URL:
-    raise ValueError("Missing Environment Variable: DISCORD_WEBHOOK_URL. Please set this in GitHub Secrets.")
+    logging.error("Missing Environment Variable: DISCORD_WEBHOOK_URL.")
+    sys.exit(1)
 if not GEMINI_API_KEY:
-    raise ValueError("Missing Environment Variable: GEMINI_API_KEY. Please set this in GitHub Secrets.")
+    logging.error("Missing Environment Variable: GEMINI_API_KEY.")
+    sys.exit(1)
 
 def get_stock_name_cn(ticker):
     """
@@ -115,7 +135,7 @@ def get_realtime_price(ticker):
 
         return None
     except Exception as e:
-        print(f"Error fetching realtime price for {ticker}: {e}")
+        logging.error(f"Error fetching realtime price for {ticker}: {e}")
         return None
 
 def load_portfolio():
@@ -133,7 +153,7 @@ def load_portfolio():
             for ticker, data in portfolio['holdings'].items():
                 # Migration 1: int -> dict
                 if isinstance(data, int):
-                    print(f"Migrating {ticker} to rich format...")
+                    logging.info(f"Migrating {ticker} to rich format...")
                     realtime_price = get_realtime_price(ticker)
                     cost_basis = realtime_price if realtime_price else 0.0
 
@@ -145,18 +165,18 @@ def load_portfolio():
                     migrated = True
                 # Migration 2: dict missing buy_reason
                 elif isinstance(data, dict) and "buy_reason" not in data:
-                    print(f"Migrating {ticker} adding buy_reason...")
+                    logging.info(f"Migrating {ticker} adding buy_reason...")
                     portfolio['holdings'][ticker]["buy_reason"] = "Legacy Position"
                     migrated = True
 
             if migrated:
-                print("Portfolio migration complete. Saving...")
+                logging.info("Portfolio migration complete. Saving...")
                 save_portfolio(portfolio)
 
             return portfolio
 
         except json.JSONDecodeError:
-            print("Error decoding portfolio.json, creating new.")
+            logging.error("Error decoding portfolio.json, creating new.")
 
     # Default Portfolio
     return {
@@ -268,7 +288,7 @@ def send_discord_notification(message):
         if response.status_code != 204 and response.status_code != 200:
             print(f"Failed to send Discord notification: {response.status_code} {response.text}")
     except Exception as e:
-        print(f"Error sending Discord notification: {e}")
+        logging.error(f"Error sending Discord notification: {e}")
 
 def parse_ai_json(response_text):
     """
@@ -282,7 +302,7 @@ def parse_ai_json(response_text):
             clean_text = clean_text[:-3]
         return json.loads(clean_text.strip())
     except Exception as e:
-        print(f"JSON Parse Error: {e}")
+        logging.error(f"JSON Parse Error: {e}")
         return None
 
 @with_retry()
@@ -292,7 +312,7 @@ def get_ai_analysis(stock_metrics, context=None, history_summary=""):
     Context: Optional dictionary with 'cost', 'profit_pct', 'shares' for existing holdings.
     history_summary: String summary of recent trade performance for in-context learning.
     """
-    print(f"Requesting AI Analysis for {stock_metrics['Name']}...")
+    logging.info(f"Requesting AI Analysis for {stock_metrics['Name']}...")
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -366,7 +386,7 @@ def get_ai_analysis(stock_metrics, context=None, history_summary=""):
         return None
 
     except Exception as e:
-        print(f"Gemini AI Error: {e}")
+        logging.error(f"Gemini AI Error: {e}")
         return None
 
 def manage_holdings(portfolio):
@@ -374,7 +394,7 @@ def manage_holdings(portfolio):
     Step 1: Manage Holdings (ADD, REDUCE, CLEAR, HOLD).
     Returns (portfolio, list_of_trade_messages, list_of_processed_tickers).
     """
-    print("Step 1: Managing Holdings...")
+    logging.info("Step 1: Managing Holdings...")
     updated_holdings = portfolio['holdings'].copy()
     trade_messages = []
     processed_tickers = []
@@ -474,7 +494,7 @@ def manage_holdings(portfolio):
 
                 msg = f"🔴 **CLEAR**: {ticker} (All {shares} shares) @ {exec_price} | Net: ${net_revenue:,.0f} (Fee: {fee}, Tax: {tax}) | P/L: {profit_pct:.2f}% | {reason}"
                 trade_messages.append(msg)
-                print(msg)
+                logging.info(msg)
 
             # REDUCE (Sell Partial)
             elif action == "REDUCE":
@@ -515,7 +535,7 @@ def manage_holdings(portfolio):
 
                     msg = f"🟠 **REDUCE**: {ticker} ({shares_to_sell} shares) @ {exec_price} | Net: ${net_revenue:,.0f} | {reason}"
                     trade_messages.append(msg)
-                    print(msg)
+                    logging.info(msg)
 
             # ADD (Buy More) - Respect 40% Global Cap
             elif action == "ADD":
@@ -537,7 +557,7 @@ def manage_holdings(portfolio):
                     # Clamp
                     allowed_buy_val = max(0, max_allowed_val - current_position_val)
                     shares_to_buy = int(allowed_buy_val / exec_price)
-                    print(f"ADD Clamped by 40% Cap for {ticker}. Reduced to {shares_to_buy} shares.")
+                    logging.warning(f"ADD Clamped by 40% Cap for {ticker}. Reduced to {shares_to_buy} shares.")
 
                 gross_cost = shares_to_buy * exec_price
                 fee = calculate_transaction_fee(gross_cost)
@@ -557,14 +577,14 @@ def manage_holdings(portfolio):
 
                     msg = f"🟢 **ADD**: {ticker} ({shares_to_buy} shares) @ {exec_price} | Cost: ${total_cost:,.0f} (Fee: {fee}) | New Avg: {new_avg_cost:.2f} | {reason}"
                     trade_messages.append(msg)
-                    print(msg)
+                    logging.info(msg)
 
             # HOLD or Unknown
             else:
-                print(f"AI Action for {ticker}: {action} (Holding)")
+                logging.info(f"AI Action for {ticker}: {action} (Holding)")
 
         except Exception as e:
-            print(f"Error managing holding {ticker}: {e}")
+            logging.error(f"Error managing holding {ticker}: {e}")
 
     portfolio['holdings'] = updated_holdings
     return portfolio, trade_messages, processed_tickers
@@ -574,7 +594,7 @@ def process_buy_signals(portfolio, candidates):
     Checks top candidates using AI for dynamic position sizing.
     Returns (portfolio, list_of_trade_messages).
     """
-    print("Step 3: Processing Buy Signals (Smart Mode)...")
+    logging.info("Step 3: Processing Buy Signals (Smart Mode)...")
     trade_messages = []
 
     # Calculate Total Value for 40% Cap
