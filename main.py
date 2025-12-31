@@ -389,6 +389,80 @@ def get_ai_analysis(stock_metrics, context=None, history_summary=""):
         logging.error(f"Gemini AI Error: {e}")
         return None
 
+@with_retry()
+def get_ai_briefing(event_type, context_data):
+    """
+    Generates a strategic briefing for Market Open or Close using Gemini 2.5.
+    event_type: "OPEN" or "CLOSE"
+    context_data: Dictionary containing market status, P/L, etc.
+    """
+    logging.info(f"Requesting AI Briefing for {event_type}...")
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        if event_type == "OPEN":
+            prompt = (
+                f"You are an aggressive growth fund manager targeting 20% Monthly Return.\n"
+                f"Current Market Status: {context_data.get('market_status', 'Unknown')}\n"
+                f"Index Price: {context_data.get('market_price', 0)}\n"
+                f"SMA60: {context_data.get('market_sma60', 0)}\n\n"
+                f"Task: The market is opening. Briefly state your strategy for today (under 100 words).\n"
+                f"- If Bullish: How will you aggressively hunt momentum?\n"
+                f"- If Bearish: How will you protect capital while looking for shorts/rebounds?\n"
+            )
+        else: # CLOSE
+            prompt = (
+                f"You are an aggressive growth fund manager.\n"
+                f"Market Closed.\n"
+                f"Trades Executed Today: {context_data.get('trades_count', 0)}\n"
+                f"Session P/L: {context_data.get('pnl_val', 0):+.0f} ({context_data.get('pnl_pct', 0):+.2f}%)\n"
+                f"Current Equity: {context_data.get('equity', 0):,.0f}\n\n"
+                f"Task: Briefly review today's performance and give a 1-sentence outlook/strategy for tomorrow (under 100 words)."
+            )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        if response.text:
+            return response.text.strip()
+        return "AI Briefing Unavailable."
+
+    except Exception as e:
+        logging.error(f"Gemini AI Briefing Error: {e}")
+        return "AI Briefing Failed."
+
+def send_daily_briefing(event_type, context_data):
+    """
+    Sends the Open/Close briefing to Discord.
+    """
+    ai_thought = get_ai_briefing(event_type, context_data)
+
+    if event_type == "OPEN":
+        title = "☀️ **開盤通知 (Opening Bell)**"
+        color = "🟢" if "Bullish" in context_data.get('market_status', '') else "🔴"
+        content = (
+            f"{title}\n"
+            f"{color} 市場狀態: **{context_data.get('market_status')}**\n"
+            f"指數: {context_data.get('market_price'):.2f} (MA60: {context_data.get('market_sma60'):.2f})\n\n"
+            f"> 🧠 **Gemini 策略思路：**\n"
+            f"> {ai_thought}"
+        )
+    else:
+        title = "🌙 **收盤報告 (Closing Bell)**"
+        pnl_color = "🟢" if context_data.get('pnl_val', 0) >= 0 else "🔴"
+        content = (
+            f"{title}\n"
+            f"📊 今日交易數: {context_data.get('trades_count')}\n"
+            f"{pnl_color} 當日損益: ${context_data.get('pnl_val'):+,.0f} ({context_data.get('pnl_pct'):+.2f}%)\n"
+            f"💰 總權益: ${context_data.get('equity'):,.0f}\n\n"
+            f"> 📝 **Gemini 復盤與展望：**\n"
+            f"> {ai_thought}"
+        )
+
+    send_discord_notification(content)
+
 def manage_holdings(portfolio):
     """
     Step 1: Manage Holdings (ADD, REDUCE, CLEAR, HOLD).
@@ -965,6 +1039,13 @@ def get_news_sentiment(ticker):
 
 def main():
     print("Starting Stock Analysis Tool...")
+
+    # Initialization for Daily P/L Tracking
+    start_portfolio = load_portfolio()
+    session_start_equity, _, _ = calculate_portfolio_value(start_portfolio)
+    trades_executed_count = 0
+    has_sent_open_notification = False
+
     if INTRADAY_MODE:
         send_discord_notification("🟢 **Bot Started**: 盤中監控模式已啟動 (每 5 分鐘掃描一次)\n🚀 目標策略：月報酬 20% (高風險高報酬模式)")
 
@@ -975,25 +1056,44 @@ def main():
             tz_tw = datetime.timezone(datetime.timedelta(hours=8))
             now = datetime.datetime.now(tz_tw)
 
-            # Simple Market Hours Check (09:00 - 13:30)
-            # This simplification assumes script is run on trading days.
             market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
             market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
 
             if INTRADAY_MODE:
                 print(f"Current Time: {now.strftime('%H:%M:%S')}")
+
+                # PRE-MARKET
                 if now < market_open:
                     print("Pre-market. Waiting...")
                     time.sleep(60)
                     continue
+
+                # MARKET CLOSED -> EXIT
                 elif now > market_close:
-                    print("Market Closed. Saving and Exiting.")
-                    # Load and Save one last time to be safe? (Not really needed if we saved in loop)
+                    print("Market Closed. Preparing Closing Report...")
+
+                    # Close Briefing
+                    end_portfolio = load_portfolio()
+                    current_equity, _, _ = calculate_portfolio_value(end_portfolio)
+                    pnl_val = current_equity - session_start_equity
+                    pnl_pct = 0
+                    if session_start_equity > 0:
+                        pnl_pct = (pnl_val / session_start_equity) * 100
+
+                    context = {
+                        "trades_count": trades_executed_count,
+                        "pnl_val": pnl_val,
+                        "pnl_pct": pnl_pct,
+                        "equity": current_equity
+                    }
+                    send_daily_briefing("CLOSE", context)
+
+                    print("Exiting Bot.")
                     break
 
             # --- START CYCLE ---
 
-            # Load Portfolio (Auto-migrates if old format)
+            # Load Portfolio
             portfolio = load_portfolio()
 
             all_messages = []
@@ -1002,9 +1102,21 @@ def main():
             # This logic runs REGARDLESS of market status (Step 1)
             portfolio, holding_msgs, processed_tickers = manage_holdings(portfolio)
             all_messages.extend(holding_msgs)
+            if holding_msgs:
+                trades_executed_count += len(holding_msgs)
 
             # Phase 2: Market Regime Filter
             is_bullish, market_msg, market_price, market_sma60 = check_market_status()
+
+            # OPENING BELL (Run once between 09:00-09:15)
+            if INTRADAY_MODE and not has_sent_open_notification and (market_open <= now <= market_open + datetime.timedelta(minutes=15)):
+                open_context = {
+                    "market_status": market_msg,
+                    "market_price": market_price,
+                    "market_sma60": market_sma60
+                }
+                send_daily_briefing("OPEN", open_context)
+                has_sent_open_notification = True
 
             if not is_bullish:
                 # Market is Bearish or Error
@@ -1114,6 +1226,8 @@ def main():
                 top_candidates_list = top_picks.to_dict('records')
                 portfolio, buy_msgs = process_buy_signals(portfolio, top_candidates_list)
                 all_messages.extend(buy_msgs)
+                if buy_msgs:
+                    trades_executed_count += len(buy_msgs)
 
                 # Save Portfolio
                 save_portfolio(portfolio)
