@@ -69,18 +69,44 @@ def get_realtime_price(ticker):
 def load_portfolio():
     """
     Loads portfolio from JSON file or creates a default one if not exists.
+    Performs migration from old format {ticker: shares} to new format {ticker: {shares, cost}}.
     """
     if os.path.exists(PORTFOLIO_FILE):
         try:
             with open(PORTFOLIO_FILE, 'r') as f:
-                return json.load(f)
+                portfolio = json.load(f)
+
+            # Migration Logic: Convert simple holdings to rich holdings
+            migrated = False
+            for ticker, data in portfolio['holdings'].items():
+                if isinstance(data, int): # Old format
+                    print(f"Migrating {ticker} to rich format...")
+                    realtime_price = get_realtime_price(ticker)
+                    # If fetch fails, use 0.0 or last close from yfinance?
+                    # User approved: "default to current market price".
+                    # If realtime fails, we can try yfinance history in analyze, but here we need it fast.
+                    # Fallback to 0 if absolutely no data, but let's try.
+                    cost_basis = realtime_price if realtime_price else 0.0
+
+                    portfolio['holdings'][ticker] = {
+                        "shares": data,
+                        "cost": cost_basis
+                    }
+                    migrated = True
+
+            if migrated:
+                print("Portfolio migration complete. Saving...")
+                save_portfolio(portfolio)
+
+            return portfolio
+
         except json.JSONDecodeError:
             print("Error decoding portfolio.json, creating new.")
 
     # Default Portfolio
     return {
         "balance": 100000,  # 100,000 TWD Initial Capital
-        "holdings": {},     # {"Ticker": Shares}
+        "holdings": {},     # {"Ticker": {"shares": int, "cost": float}}
         "history": []       # List of transaction logs
     }
 
@@ -100,22 +126,34 @@ def calculate_portfolio_value(portfolio):
     holdings_value = 0
     details = []
 
-    for ticker, shares in portfolio['holdings'].items():
+    for ticker, data in portfolio['holdings'].items():
+        # Handle both old (int) and new (dict) formats just in case, though migration should fix it
+        if isinstance(data, int):
+            shares = data
+            # cost = 0 # unknown
+        else:
+            shares = data['shares']
+            # cost = data['cost']
+
         try:
-            # Fetch current price
-            # Note: In a real loop, we might have this data already, but for safety fetching fresh
-            stock = yf.Ticker(ticker)
-            # Use 'fast' fetch if possible, history(period='1d')
-            hist = stock.history(period="1d")
-            if not hist.empty:
-                current_price = hist['Close'].iloc[-1]
+            # Use real-time price first
+            current_price = get_realtime_price(ticker)
+
+            if current_price:
                 value = current_price * shares
                 holdings_value += value
                 details.append(f"{ticker}: {shares}股 (${value:,.0f})")
             else:
-                # Fallback if no data (delisted?), assume cost basis or last known?
-                # For safety, just keep as 0 but warn
-                details.append(f"{ticker}: {shares}股 (No Data)")
+                # Fallback to yfinance if realtime fails
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="1d")
+                if not hist.empty:
+                    current_price = hist['Close'].iloc[-1]
+                    value = current_price * shares
+                    holdings_value += value
+                    details.append(f"{ticker}: {shares}股 (${value:,.0f})")
+                else:
+                    details.append(f"{ticker}: {shares}股 (No Data)")
         except Exception:
              details.append(f"{ticker}: {shares}股 (Error)")
 
@@ -155,28 +193,53 @@ def parse_ai_json(response_text):
         print(f"JSON Parse Error: {e}")
         return None
 
-def get_ai_analysis(stock_metrics, purpose="BUY"):
+def get_ai_analysis(stock_metrics, context=None):
     """
     Uses Gemini 2.5 Flash to generate a JSON decision.
-    Purpose: "BUY" (for candidates) or "SELL" (for holdings).
+    Context: Optional dictionary with 'cost', 'profit_pct', 'shares' for existing holdings.
     """
-    print(f"Requesting AI Decision for {stock_metrics['Name']} ({purpose})...")
+    print(f"Requesting AI Analysis for {stock_metrics['Name']}...")
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
 
-        prompt = (
-            f"You are a professional fund manager trading Taiwan stocks. "
-            f"Analyze this data for {stock_metrics['Name']} ({stock_metrics['Ticker']}) to make a {purpose} decision:\n"
+        # Base Data
+        data_str = (
+            f"Analyze this data for {stock_metrics['Name']} ({stock_metrics['Ticker']}):\n"
             f"Price: {stock_metrics['Price']}\n"
             f"Trend Score: {stock_metrics['Trend_Score']:.2f}\n"
             f"RSI: {stock_metrics['RSI']:.2f}\n"
             f"Foreign Net Buy: {stock_metrics['Foreign_Buy']}\n"
             f"News Sentiment: {stock_metrics['News_Sentiment_Score']:.2f}\n"
+        )
+
+        if context:
+            # Holding Context
+            data_str += (
+                f"Current Status: HOLDING\n"
+                f"Avg Cost: {context['cost']}\n"
+                f"Current Profit/Loss: {context['profit_pct']:.2f}%\n"
+                f"Quantity Held: {context['shares']}\n"
+                f"Task: Decide whether to INCREASE position (ADD), DECREASE position (REDUCE), EXIT (CLEAR), or HOLD.\n"
+            )
+            json_req = (
+                f"action: 'ADD', 'REDUCE', 'CLEAR', or 'HOLD'\n"
+                f"percentage: float 0.1-1.0 (If ADD: % of Available Cash. If REDUCE: % of Shares to sell).\n"
+            )
+        else:
+            # Candidate Context
+            data_str += "Task: Decide whether to open a NEW position (BUY) or skip (HOLD).\n"
+            json_req = (
+                f"action: 'BUY' or 'HOLD'\n"
+                f"percentage: float 0.01-1.00 (Percentage of available cash to invest).\n"
+            )
+
+        prompt = (
+            f"You are a professional fund manager trading Taiwan stocks. "
+            f"{data_str}"
             f"Respond strictly with a valid JSON object (no markdown) with these keys:\n"
-            f"decision: 'BUY', 'SELL', or 'HOLD'\n"
+            f"{json_req}"
             f"confidence: integer 0-100\n"
-            f"reason: Brief reason in Traditional Chinese (under 30 words).\n"
-            f"allocation_percent: float 0.01-1.00 (Percentage of available cash to invest)."
+            f"reason: Brief reason in Traditional Chinese (under 30 words)."
         )
 
         response = client.models.generate_content(
@@ -192,126 +255,187 @@ def get_ai_analysis(stock_metrics, purpose="BUY"):
         print(f"Gemini AI Error: {e}")
         return None
 
-def process_sell_signals(portfolio):
+def manage_holdings(portfolio):
     """
-    Checks existing holdings for sell signals (Trend_Score < 0).
-    Returns (portfolio, list_of_trade_messages).
+    Step 1: Manage Holdings (ADD, REDUCE, CLEAR, HOLD).
+    Returns (portfolio, list_of_trade_messages, list_of_processed_tickers).
     """
-    print("Processing Sell Signals for Holdings...")
+    print("Step 1: Managing Holdings...")
     updated_holdings = portfolio['holdings'].copy()
     trade_messages = []
+    processed_tickers = []
 
-    for ticker, shares in portfolio['holdings'].items():
+    # Calculate Total Portfolio Value for Risk Management (used in ADD)
+    total_asset_value, _, _ = calculate_portfolio_value(portfolio)
+
+    for ticker, data in portfolio['holdings'].items():
+        processed_tickers.append(ticker)
+        # Handle format (migration should have ensured dict, but be safe)
+        if isinstance(data, int):
+            shares = data
+            avg_cost = 0.0
+        else:
+            shares = data['shares']
+            avg_cost = data.get('cost', 0.0)
+
         try:
-            # We need to analyze the stock again to get the Trend_Score and AI check
             metrics = analyze_technicals(ticker)
-            metrics['Name'] = get_stock_name_cn(ticker) # Fetch name for AI
+            metrics['Name'] = get_stock_name_cn(ticker)
 
-            # Use Real-time price for execution
+            # Real-time Price
             realtime_price = get_realtime_price(ticker)
             exec_price = realtime_price if realtime_price else metrics['Price']
 
-            # 1. Technical Sell Check
-            tech_sell = metrics['Trend_Score'] < -5 # Hard Stop if Trend crashes
+            # P/L %
+            profit_pct = 0.0
+            if avg_cost > 0:
+                profit_pct = ((exec_price - avg_cost) / avg_cost) * 100
 
-            # 2. AI Sell Check
-            ai_sell = False
-            ai_reason = "Technical Stop"
+            # AI Context
+            context = {
+                "cost": avg_cost,
+                "profit_pct": profit_pct,
+                "shares": shares
+            }
 
-            ai_result = get_ai_analysis(metrics, purpose="SELL")
+            # AI Decision
+            ai_result = get_ai_analysis(metrics, context=context)
+            action = "HOLD"
+            percentage = 0.0
+            reason = "N/A"
+
             if ai_result:
-                decision = ai_result.get("decision", "HOLD")
-                if decision == "SELL":
-                    ai_sell = True
-                    ai_reason = f"AI: {ai_result.get('reason', 'Sell')}"
+                action = ai_result.get("action", "HOLD")
+                percentage = float(ai_result.get("percentage", 0.0))
+                reason = ai_result.get("reason", "N/A")
 
-            # Execute Sell if EITHER condition is true
-            if tech_sell or ai_sell:
+            # --- EXECUTION LOGIC ---
+
+            # CLEAR (Sell All)
+            if action == "CLEAR":
                 revenue = exec_price * shares
                 portfolio['balance'] += revenue
                 del updated_holdings[ticker]
 
-                reason_str = ai_reason if ai_sell else "Trend Score < -5"
-
-                # Log
-                log = {
-                    "action": "SELL",
-                    "ticker": ticker,
-                    "price": exec_price,
-                    "shares": shares,
-                    "reason": reason_str,
-                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                portfolio['history'].append(log)
-
-                msg = f"🔴 **SELL**: {ticker} ({shares}股) @ {exec_price} | {reason_str}"
-                print(msg)
+                msg = f"🔴 **CLEAR**: {ticker} (All {shares} shares) @ {exec_price} | P/L: {profit_pct:.2f}% | {reason}"
                 trade_messages.append(msg)
+                print(msg)
+
+            # REDUCE (Sell Partial)
+            elif action == "REDUCE":
+                sell_ratio = max(0.1, min(percentage, 1.0)) # Clamp 10%-100%
+                shares_to_sell = int(shares * sell_ratio)
+
+                if shares_to_sell > 0:
+                    revenue = exec_price * shares_to_sell
+                    portfolio['balance'] += revenue
+                    updated_holdings[ticker]['shares'] -= shares_to_sell
+
+                    if updated_holdings[ticker]['shares'] == 0:
+                        del updated_holdings[ticker] # Fully reduced?
+
+                    msg = f"🟠 **REDUCE**: {ticker} ({shares_to_sell} shares) @ {exec_price} | {reason}"
+                    trade_messages.append(msg)
+                    print(msg)
+
+            # ADD (Buy More) - Respect 40% Global Cap
+            elif action == "ADD":
+                alloc_ratio = max(0.01, min(percentage, 1.0)) # % of Cash
+                invest_amount = portfolio['balance'] * alloc_ratio
+                shares_to_buy = int(invest_amount / exec_price)
+
+                # Check Global Cap
+                current_position_val = shares * exec_price
+                new_position_val = current_position_val + (shares_to_buy * exec_price)
+
+                max_allowed_val = total_asset_value * MAX_POSITION_RATIO
+
+                if new_position_val > max_allowed_val:
+                    # Clamp
+                    allowed_buy_val = max(0, max_allowed_val - current_position_val)
+                    shares_to_buy = int(allowed_buy_val / exec_price)
+                    print(f"ADD Clamped by 40% Cap for {ticker}. Reduced to {shares_to_buy} shares.")
+
+                if shares_to_buy > 0 and portfolio['balance'] >= (shares_to_buy * exec_price):
+                    cost = shares_to_buy * exec_price
+                    portfolio['balance'] -= cost
+
+                    # Update Avg Cost
+                    total_shares_new = shares + shares_to_buy
+                    total_cost_new = (shares * avg_cost) + cost
+                    new_avg_cost = total_cost_new / total_shares_new
+
+                    updated_holdings[ticker]['shares'] = total_shares_new
+                    updated_holdings[ticker]['cost'] = new_avg_cost
+
+                    msg = f"🟢 **ADD**: {ticker} ({shares_to_buy} shares) @ {exec_price} | New Cost: {new_avg_cost:.2f} | {reason}"
+                    trade_messages.append(msg)
+                    print(msg)
+
+            # HOLD or Unknown
+            else:
+                print(f"AI Action for {ticker}: {action} (Holding)")
 
         except Exception as e:
-            print(f"Error checking sell signal for {ticker}: {e}")
+            print(f"Error managing holding {ticker}: {e}")
 
     portfolio['holdings'] = updated_holdings
-    return portfolio, trade_messages
+    return portfolio, trade_messages, processed_tickers
 
 def process_buy_signals(portfolio, candidates):
     """
     Checks top candidates using AI for dynamic position sizing.
     Returns (portfolio, list_of_trade_messages).
     """
-    print("Processing Buy Signals (Smart Mode)...")
+    print("Step 3: Processing Buy Signals (Smart Mode)...")
     trade_messages = []
+
+    # Calculate Total Value for 40% Cap
+    total_asset_value, _, _ = calculate_portfolio_value(portfolio)
 
     for candidate in candidates:
         ticker = candidate['Ticker']
 
-        # Duplicate Prevention: Do not buy if already owned
-        if ticker in portfolio['holdings']:
-            print(f"Skipping {ticker}: Already in portfolio.")
-            continue
-
-        # Use Real-time price for execution if possible
+        # Use Real-time price
         realtime_price = get_realtime_price(ticker)
         exec_price = realtime_price if realtime_price else candidate['Price']
 
         # 1. AI Analysis
-        ai_result = get_ai_analysis(candidate, purpose="BUY")
+        ai_result = get_ai_analysis(candidate)
 
-        ai_decision = "HOLD"
-        ai_confidence = 0
-        ai_allocation = 0.10 # Default 10%
+        ai_action = "HOLD"
+        ai_percentage = 0.10
+        ai_reason = "N/A"
 
         if ai_result:
-            ai_decision = ai_result.get("decision", "HOLD")
-            ai_confidence = int(ai_result.get("confidence", 0))
-            raw_allocation = ai_result.get("allocation_percent", 0.10)
+            ai_action = ai_result.get("action", "HOLD")
+            ai_percentage = float(ai_result.get("percentage", 0.10))
+            ai_reason = ai_result.get("reason", "N/A")
 
-            # Sanitization & Clamping
-            try:
-                ai_allocation = float(raw_allocation)
-                if ai_allocation > 1.0:
-                    ai_allocation /= 100.0
-                ai_allocation = max(0.01, min(ai_allocation, 1.0))
-            except:
-                ai_allocation = 0.10
+            # Sanitization
+            if ai_percentage > 1.0:
+                ai_percentage /= 100.0
+            ai_percentage = max(0.01, min(ai_percentage, 1.0))
 
-            # Store for notification
-            candidate['AI_Decision'] = ai_decision
-            candidate['AI_Confidence'] = ai_confidence
+            candidate['AI_Decision'] = ai_action
+            candidate['AI_Reason'] = ai_reason
 
-        # Buy Condition: AI says BUY and Confidence > 75
-        if ai_decision == "BUY" and ai_confidence > 75:
+        # Buy Condition: Action is BUY
+        if ai_action == "BUY":
 
-            # 2. Dynamic Position Sizing (Based on Remaining Cash)
-            current_cash = portfolio['balance']
-            invest_amount = current_cash * ai_allocation
-
-            # Calculate shares
+            # 2. Position Sizing
+            invest_amount = portfolio['balance'] * ai_percentage
             shares_to_buy = int(invest_amount / exec_price)
 
-            # Round down to nearest 10 if possible, else 1
-            if shares_to_buy >= 10:
-                shares_to_buy = (shares_to_buy // 10) * 10
+            # 3. Global Cap Check (40%)
+            # Projected holding value = 0 (since it's new) + new buy value
+            projected_value = shares_to_buy * exec_price
+            max_allowed_val = total_asset_value * MAX_POSITION_RATIO
+
+            if projected_value > max_allowed_val:
+                allowed_val = max(0, max_allowed_val) # current holding is 0
+                shares_to_buy = int(allowed_val / exec_price)
+                print(f"BUY Clamped by 40% Cap for {ticker}. Reduced to {shares_to_buy} shares.")
 
             cost = shares_to_buy * exec_price
 
@@ -319,12 +443,13 @@ def process_buy_signals(portfolio, candidates):
             if shares_to_buy > 0 and portfolio['balance'] >= cost:
                 portfolio['balance'] -= cost
 
-                if ticker in portfolio['holdings']:
-                    portfolio['holdings'][ticker] += shares_to_buy
-                else:
-                    portfolio['holdings'][ticker] = shares_to_buy
+                # New Position
+                portfolio['holdings'][ticker] = {
+                    "shares": shares_to_buy,
+                    "cost": exec_price
+                }
 
-                reason_str = f"AI: {ai_decision} ({ai_confidence}%) | Alloc: {ai_allocation*100:.1f}%"
+                reason_str = f"AI: {ai_action} | Alloc: {ai_percentage*100:.1f}% | {ai_reason}"
 
                 # Log
                 log = {
@@ -341,9 +466,9 @@ def process_buy_signals(portfolio, candidates):
                 print(msg)
                 trade_messages.append(msg)
             else:
-                print(f"Skipped {ticker}: Insufficient Cash for AI allocation (${invest_amount:,.0f})")
+                print(f"Skipped {ticker}: Insufficient Cash/Allocation (${invest_amount:,.0f})")
         else:
-            print(f"Skipped {ticker}: AI says {ai_decision} ({ai_confidence}%)")
+            print(f"Skipped {ticker}: AI says {ai_action}")
 
     return portfolio, trade_messages
 
@@ -617,28 +742,29 @@ def main():
 
             # --- START CYCLE ---
 
-            # Load Portfolio
+            # Load Portfolio (Auto-migrates if old format)
             portfolio = load_portfolio()
 
             all_messages = []
 
-            # Phase 1: Sell Check (Run regardless of market status)
-            portfolio, sell_msgs = process_sell_signals(portfolio)
-            all_messages.extend(sell_msgs)
+            # Phase 1: Manage Holdings (Sell/Add/Reduce)
+            # This logic runs REGARDLESS of market status (Step 1)
+            portfolio, holding_msgs, processed_tickers = manage_holdings(portfolio)
+            all_messages.extend(holding_msgs)
 
-            # 0. Market Regime Filter
+            # Phase 2: Market Regime Filter
             is_bullish, market_msg, market_price, market_sma60 = check_market_status()
 
             if not is_bullish:
                 # Market is Bearish or Error
                 print(f"⚠️ Market Bearish/Error: {market_msg}. Skipping Buy Scan.")
 
-                # If we had sell messages, we should notify
-                if sell_msgs:
+                # If we had holding messages, we should notify
+                if holding_msgs:
                     halt_msg = (
                         f"**⚠️ 系統暫停 (System Halted)**\n"
                         f"市場狀態: {market_msg}\n"
-                        f"**Transactions:**\n" + "\n".join(sell_msgs)
+                        f"**Transactions (Holdings):**\n" + "\n".join(holding_msgs)
                     )
                     send_discord_notification(halt_msg)
 
@@ -653,19 +779,17 @@ def main():
 
             print(f"Market Status: Bullish. Proceeding to Scan...")
 
-            # 1. Get Stock List
+            # Phase 3: Scan New Opportunities
             stocks = get_stock_list()
 
             all_results = []
             candidates = []
 
-            print("Step 1: Technical & Performance Scan")
+            print("Step 2: Technical & Performance Scan (Candidates)")
             # If Intraday, maybe we don't need tqdm as it clogs logs? Keeping it for now.
             for ticker in tqdm(stocks):
-                # Optimization: Check if we already hold it BEFORE scanning?
-                # Actually user requirement said check in buy logic, but checking here saves API calls.
-                # Requirement: "Duplicate Prevention: inside the loop, before analyzing a stock, check: if stock_id in portfolio["holdings"]: continue."
-                if ticker in portfolio['holdings']:
+                # Check if processed in Step 1 (Holdings)
+                if ticker in processed_tickers:
                     continue
 
                 # Step A: Analyze Technicals
