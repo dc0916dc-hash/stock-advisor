@@ -5,6 +5,7 @@ import twstock
 from tqdm import tqdm
 from FinMind.data import DataLoader
 from textblob import TextBlob
+import feedparser
 import time
 import sys
 import datetime
@@ -42,6 +43,9 @@ MAX_POSITION_RATIO = 0.40
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PORTFOLIO_FILE = os.path.join(BASE_DIR, "portfolio.json")
+
+# Global State for Market Sentiment
+DAILY_MARKET_SENTIMENT = "Neutral"
 
 # Battlefield Targets (High Volume / Momentum)
 BATTLEFIELD_TARGETS = [
@@ -100,6 +104,56 @@ def with_retry(retries=3, delay=10):
             return None
         return wrapper
     return decorator
+
+@with_retry()
+def fetch_macro_news():
+    """
+    Fetches macro news from Anue RSS (https://news.cnyes.com/rss/cat/209).
+    Returns a string summary of the top 5 news items.
+    """
+    try:
+        url = "https://news.cnyes.com/rss/cat/209"
+        feed = feedparser.parse(url)
+
+        summary_list = []
+        # Get top 5 entries
+        for entry in feed.entries[:5]:
+            title = entry.title
+            # summary is often HTML, strip tags if needed or just use title
+            # Anue summary is usually clean enough or just take title
+            summary_list.append(f"- {title}")
+
+        if not summary_list:
+            return "No Macro News Available."
+
+        return "\n".join(summary_list)
+    except Exception as e:
+        logging.error(f"Error fetching macro news: {e}")
+        return "Error fetching macro news."
+
+@with_retry()
+def fetch_stock_news(ticker):
+    """
+    Fetches the latest specific news for a stock using yfinance.
+    Returns the top 2 headlines with links.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        news = stock.news
+
+        if not news:
+            return "No specific news found."
+
+        news_items = []
+        for item in news[:2]: # Top 2
+            title = item.get('title', 'No Title')
+            link = item.get('link', '#')
+            news_items.append(f"- {title} ({link})")
+
+        return "\n".join(news_items)
+    except Exception as e:
+        logging.error(f"Error fetching news for {ticker}: {e}")
+        return "Error fetching stock news."
 
 def calculate_transaction_fee(amount):
     """
@@ -306,11 +360,13 @@ def parse_ai_json(response_text):
         return None
 
 @with_retry()
-def get_ai_analysis(stock_metrics, context=None, history_summary=""):
+def get_ai_analysis(stock_metrics, context=None, history_summary="", global_sentiment="Neutral", stock_news=""):
     """
-    Uses Gemini 2.5 Flash to generate a JSON decision with Self-Learning context.
+    Uses Gemini 2.5 Flash to generate a JSON decision with Self-Learning context and News Intelligence.
     Context: Optional dictionary with 'cost', 'profit_pct', 'shares' for existing holdings.
     history_summary: String summary of recent trade performance for in-context learning.
+    global_sentiment: Morning macro sentiment string.
+    stock_news: Specific news headlines for the stock.
     """
     logging.info(f"Requesting AI Analysis for {stock_metrics['Name']}...")
     try:
@@ -331,12 +387,14 @@ def get_ai_analysis(stock_metrics, context=None, history_summary=""):
         # Base Data
         data_str = (
             f"{learning_str}"
+            f"🌍 GLOBAL MARKET SENTIMENT (Morning Briefing): {global_sentiment}\n\n"
+            f"📰 LATEST STOCK NEWS:\n{stock_news}\n\n"
             f"Analyze this data for {stock_metrics['Name']} ({stock_metrics['Ticker']}):\n"
             f"Price: {stock_metrics['Price']}\n"
             f"Trend Score: {stock_metrics['Trend_Score']:.2f}\n"
             f"RSI: {stock_metrics['RSI']:.2f}\n"
             f"Foreign Net Buy: {stock_metrics['Foreign_Buy']}\n"
-            f"News Sentiment: {stock_metrics['News_Sentiment_Score']:.2f}\n"
+            f"News Sentiment Score (TextBlob): {stock_metrics['News_Sentiment_Score']:.2f}\n"
             f"Technical Indicators:\n"
             f"- MACD: {stock_metrics.get('MACD_Status', 'N/A')} (Hist: {stock_metrics.get('MACD_Hist', 0):.2f})\n"
             f"- Bollinger Bands: Price is at {stock_metrics.get('BB_Pct', 0)*100:.1f}% of the band width.\n"
@@ -405,8 +463,10 @@ def get_ai_briefing(event_type, context_data):
                 f"You are an aggressive growth fund manager targeting 20% Monthly Return.\n"
                 f"Current Market Status: {context_data.get('market_status', 'Unknown')}\n"
                 f"Index Price: {context_data.get('market_price', 0)}\n"
-                f"SMA60: {context_data.get('market_sma60', 0)}\n\n"
+                f"SMA60: {context_data.get('market_sma60', 0)}\n"
+                f"Morning News Headlines:\n{context_data.get('macro_news', 'N/A')}\n\n"
                 f"Task: The market is opening. Briefly state your strategy for today (under 100 words).\n"
+                f"Synthesize the macro news and technical status.\n"
                 f"- If Bullish: How will you aggressively hunt momentum?\n"
                 f"- If Bearish: How will you protect capital while looking for shorts/rebounds?\n"
             )
@@ -449,6 +509,11 @@ def send_daily_briefing(event_type, context_data):
             f"> 🧠 **Gemini 策略思路：**\n"
             f"> {ai_thought}"
         )
+
+        # Update Global Sentiment
+        global DAILY_MARKET_SENTIMENT
+        DAILY_MARKET_SENTIMENT = ai_thought
+
     else:
         title = "🌙 **收盤報告 (Closing Bell)**"
         pnl_color = "🟢" if context_data.get('pnl_val', 0) >= 0 else "🔴"
@@ -516,8 +581,18 @@ def manage_holdings(portfolio):
                 "buy_reason": buy_reason
             }
 
+            # Fetch Stock News
+            stock_news = fetch_stock_news(ticker)
+
             # AI Decision
-            ai_result = get_ai_analysis(metrics, context=context, history_summary=history_summary)
+            ai_result = get_ai_analysis(
+                metrics,
+                context=context,
+                history_summary=history_summary,
+                global_sentiment=DAILY_MARKET_SENTIMENT,
+                stock_news=stock_news
+            )
+
             action = "HOLD"
             confidence = 0
             percentage = 0.0
@@ -687,8 +762,16 @@ def process_buy_signals(portfolio, candidates):
         realtime_price = get_realtime_price(ticker)
         exec_price = realtime_price if realtime_price else candidate['Price']
 
+        # Fetch Stock News
+        stock_news = fetch_stock_news(ticker)
+
         # 1. AI Analysis
-        ai_result = get_ai_analysis(candidate, history_summary=history_summary)
+        ai_result = get_ai_analysis(
+            candidate,
+            history_summary=history_summary,
+            global_sentiment=DAILY_MARKET_SENTIMENT,
+            stock_news=stock_news
+        )
 
         ai_action = "HOLD"
         ai_confidence = 0
@@ -1056,13 +1139,41 @@ def main():
             tz_tw = datetime.timezone(datetime.timedelta(hours=8))
             now = datetime.datetime.now(tz_tw)
 
+            # Schedules
+            morning_briefing_time = now.replace(hour=8, minute=30, second=0, microsecond=0)
             market_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
             market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
 
             if INTRADAY_MODE:
                 print(f"Current Time: {now.strftime('%H:%M:%S')}")
 
-                # PRE-MARKET
+                # 08:30 - 09:00: MORNING BRIEFING
+                # Run this only once per day. Logic: If it's past 08:30 and before 09:00 and we haven't sent it.
+                # However, to keep it simple in this loop, we can trigger it if current time is within window
+                # and relying on a 'has_sent_open_notification' flag which we already have, but that was for 09:00.
+
+                # We reuse 'has_sent_open_notification' for the 08:30 briefing instead of 09:00 open.
+                # Reset logic if needed, but for now we assume bot restarts or runs continuously.
+                if not has_sent_open_notification and (morning_briefing_time <= now < market_close):
+                    print("Generating Morning Briefing...")
+
+                    # Fetch Macro News
+                    macro_news = fetch_macro_news()
+
+                    # Check Market Technicals (Previous Close)
+                    is_bullish, market_msg, market_price, market_sma60 = check_market_status()
+
+                    open_context = {
+                        "market_status": market_msg,
+                        "market_price": market_price,
+                        "market_sma60": market_sma60,
+                        "macro_news": macro_news
+                    }
+
+                    send_daily_briefing("OPEN", open_context)
+                    has_sent_open_notification = True
+
+                # PRE-MARKET WAIT
                 if now < market_open:
                     print("Pre-market. Waiting...")
                     time.sleep(60)
@@ -1108,15 +1219,8 @@ def main():
             # Phase 2: Market Regime Filter
             is_bullish, market_msg, market_price, market_sma60 = check_market_status()
 
-            # OPENING BELL (Run once between 09:00-09:15)
-            if INTRADAY_MODE and not has_sent_open_notification and (market_open <= now <= market_open + datetime.timedelta(minutes=15)):
-                open_context = {
-                    "market_status": market_msg,
-                    "market_price": market_price,
-                    "market_sma60": market_sma60
-                }
-                send_daily_briefing("OPEN", open_context)
-                has_sent_open_notification = True
+            # OPENING BELL (Redundant if Morning Briefing already sent, but keeping logic safe)
+            # Removed the duplicate open notification block since it's handled above at 08:30
 
             if not is_bullish:
                 # Market is Bearish or Error

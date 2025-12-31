@@ -8,3 +8,4 @@ textblob
 requests
 google-genai
 python-dotenv
+feedparser
