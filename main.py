@@ -345,74 +345,28 @@ def get_segment_values(portfolio):
 
     return active_total, safe_total, active_val, safe_val
 
-def rebalance_capital(portfolio):
+def check_capital_rescue(portfolio):
     """
-    Implements Profit Harvesting & Capital Protection Protocol.
-    Scenario A (Harvest): Active > 100k -> Buy 00878.
-    Scenario B (Rescue): Active < 100k & Safe > 0 -> Sell 00878.
+    Function A: Safety Net (Loss Recovery).
+    Trigger: After SELL trades AND at Market Close.
+    Logic: If Active < 100k AND Safe > 0, sell Safe Asset to restore Principal.
     """
-    logging.info("Checking for Capital Rebalancing...")
+    logging.info("Checking for Capital Rescue (Safety Net)...")
     active_total, safe_total, _, _ = get_segment_values(portfolio)
     initial_principal = portfolio.get('initial_principal', INITIAL_CAPITAL)
 
-    rebalanced = False
+    triggered = False
 
-    # Scenario A: Profit Harvesting
-    # Constraint: Harvest until Safe Bucket reaches Initial Principal (Phase 2)
-    # If safe_total >= initial_principal, we stop harvesting (Growth Phase)
-    if active_total > initial_principal and safe_total < initial_principal:
-        surplus = active_total - initial_principal
-        # Safety: Ensure surplus is significant enough to trade (e.g. > 1000 TWD)
-        if surplus > 1000:
-            price = get_realtime_price(SAFE_ASSET_TICKER)
-            if price:
-                # We need to spend 'surplus' from Cash.
-                # However, surplus includes Stock Value. We can only spend Cash.
-                # Max buy = portfolio['balance'].
-                # Invest Amount = min(surplus, portfolio['balance'])
-                invest_amount = min(surplus, portfolio['balance'])
-
-                # Further constraint: Keep a small buffer? No, aggressive harvest.
-                if invest_amount > price:
-                    shares_to_buy = int(invest_amount / price)
-                    if shares_to_buy > 0:
-                        gross_cost = shares_to_buy * price
-                        fee = calculate_transaction_fee(gross_cost)
-                        total_cost = gross_cost + fee
-
-                        if portfolio['balance'] >= total_cost:
-                            portfolio['balance'] -= total_cost
-
-                            # Update Safe Holdings
-                            current_data = portfolio['safe_holdings'].get(SAFE_ASSET_TICKER, {'shares': 0, 'cost': 0.0})
-                            old_shares = current_data['shares']
-                            old_cost = current_data['cost'] * old_shares
-
-                            new_shares = old_shares + shares_to_buy
-                            new_avg = (old_cost + total_cost) / new_shares
-
-                            portfolio['safe_holdings'][SAFE_ASSET_TICKER] = {
-                                "shares": new_shares,
-                                "cost": new_avg,
-                                "buy_reason": "Profit Harvesting"
-                            }
-
-                            logging.info(f"💰 HARVEST: Moved ${total_cost:,.0f} from Active to Safe ({shares_to_buy} shares of {SAFE_ASSET_TICKER}).")
-                            send_discord_notification(f"💰 **獲利收割 (Harvest)**: 移轉 ${total_cost:,.0f} 至避險資產 ({SAFE_ASSET_TICKER}).")
-                            rebalanced = True
-
-    # Scenario B: Capital Rescue
-    elif active_total < initial_principal and safe_total > 0:
+    if active_total < initial_principal and safe_total > 0:
         deficit = initial_principal - active_total
-        if deficit > 1000: # Threshold
+        # Threshold to avoid micro-trades
+        if deficit > 1000:
             price = get_realtime_price(SAFE_ASSET_TICKER)
             if price:
-                # Need to recover 'deficit' amount.
-                # Liquidity available = safe_total.
                 amount_to_liquidate = min(deficit, safe_total)
                 shares_to_sell = int(amount_to_liquidate / price)
 
-                current_shares = portfolio['safe_holdings'][SAFE_ASSET_TICKER]['shares']
+                current_shares = portfolio['safe_holdings'].get(SAFE_ASSET_TICKER, {}).get('shares', 0)
                 shares_to_sell = min(shares_to_sell, current_shares)
 
                 if shares_to_sell > 0:
@@ -428,9 +382,101 @@ def rebalance_capital(portfolio):
                     if portfolio['safe_holdings'][SAFE_ASSET_TICKER]['shares'] == 0:
                         del portfolio['safe_holdings'][SAFE_ASSET_TICKER]
 
-                    logging.info(f"🛡️ RESCUE: Liquidated ${net_rev:,.0f} from Safe to Active ({shares_to_sell} shares).")
-                    send_discord_notification(f"🛡️ **資金救援 (Rescue)**: 從避險資產贖回 ${net_rev:,.0f} 補充主力本金.")
-                    rebalanced = True
+                    msg = f"⛑️ **Rescue Triggered**: Sold ${net_rev:,.0f} of Safe Asset to restore Principal."
+                    logging.info(msg)
+                    send_discord_notification(msg)
+                    triggered = True
+
+    return portfolio, triggered
+
+def check_profit_harvest_ai(portfolio):
+    """
+    Function B: AI Profit Harvesting (The Manager).
+    Trigger: ONLY at Market Close.
+    Logic: If Active > 100k, ask Gemini: KEEP or HARVEST?
+    """
+    logging.info("Checking for AI Profit Harvesting...")
+    active_total, safe_total, _, _ = get_segment_values(portfolio)
+    initial_principal = portfolio.get('initial_principal', INITIAL_CAPITAL)
+
+    surplus = active_total - initial_principal
+
+    if surplus <= 0:
+        return portfolio
+
+    # AI Decision Logic
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        active_positions_count = len(portfolio['active_holdings'])
+        current_cash = portfolio['balance']
+
+        prompt = (
+            f"We have a PROFIT SURPLUS of ${surplus:,.0f} (Active Total: ${active_total:,.0f}).\n"
+            f"Current Context:\n"
+            f"- Active Cash: ${current_cash:,.0f}\n"
+            f"- Active Positions Count: {active_positions_count}\n"
+            f"- Market Sentiment: {DAILY_MARKET_SENTIMENT}\n"
+            f"Strategy: Aggressive 20% Monthly Return.\n\n"
+            f"Decision: Should we (A) KEEP this cash to buy more aggressive stocks tomorrow? or (B) HARVEST profit to Safe Bucket ({SAFE_ASSET_TICKER})?\n"
+            f"Output JSON: {{'action': 'KEEP' or 'HARVEST', 'amount': <float>}}.\n"
+            f"Note: 'amount' is how much of the surplus to move (if HARVEST). Keep it 0 if KEEP."
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        decision = {}
+        if response.text:
+            decision = parse_ai_json(response.text)
+
+        action = decision.get('action', 'KEEP')
+        amount = float(decision.get('amount', 0.0))
+
+        if action == "HARVEST" and amount > 0:
+            # Execution: Buy 00878
+            # Limit by actual cash available and surplus
+            real_amount = min(amount, current_cash)
+            # Also limit by surplus? The prompt implies amount <= surplus, but strict math:
+            # We are effectively moving cash.
+
+            if real_amount > 1000: # Min threshold
+                price = get_realtime_price(SAFE_ASSET_TICKER)
+                if price:
+                     if real_amount > price:
+                        shares_to_buy = int(real_amount / price)
+                        if shares_to_buy > 0:
+                            gross_cost = shares_to_buy * price
+                            fee = calculate_transaction_fee(gross_cost)
+                            total_cost = gross_cost + fee
+
+                            if portfolio['balance'] >= total_cost:
+                                portfolio['balance'] -= total_cost
+
+                                # Update Safe Holdings
+                                current_data = portfolio['safe_holdings'].get(SAFE_ASSET_TICKER, {'shares': 0, 'cost': 0.0})
+                                old_shares = current_data['shares']
+                                old_cost = current_data['cost'] * old_shares
+
+                                new_shares = old_shares + shares_to_buy
+                                new_avg = (old_cost + total_cost) / new_shares
+
+                                portfolio['safe_holdings'][SAFE_ASSET_TICKER] = {
+                                    "shares": new_shares,
+                                    "cost": new_avg,
+                                    "buy_reason": "AI Harvest"
+                                }
+
+                                msg = f"💰 **AI Harvested**: ${total_cost:,.0f} moved to Safe Bucket."
+                                logging.info(msg)
+                                send_discord_notification(msg)
+        else:
+            logging.info(f"🔥 AI decided to reinvest profit (KEEP). Surplus ${surplus:,.0f} remains in Active Cash.")
+
+    except Exception as e:
+        logging.error(f"AI Harvesting Error: {e}")
 
     return portfolio
 
@@ -872,9 +918,9 @@ def manage_holdings(portfolio):
 
     portfolio['active_holdings'] = updated_holdings
 
-    # Trigger Rebalance if we sold anything
+    # Trigger Rescue if we sold anything (Immediate Safety Net)
     if has_sold:
-        portfolio = rebalance_capital(portfolio)
+        portfolio, triggered = check_capital_rescue(portfolio)
 
     return portfolio, trade_messages, processed_tickers
 
@@ -1326,8 +1372,12 @@ def main():
                     # Close Briefing
                     end_portfolio = load_portfolio()
 
-                    # Run Capital Rebalancing at Close
-                    end_portfolio = rebalance_capital(end_portfolio)
+                    # 1. Run Capital Rescue (Safety Net)
+                    end_portfolio, _ = check_capital_rescue(end_portfolio)
+
+                    # 2. Run AI Profit Harvesting (The Manager)
+                    end_portfolio = check_profit_harvest_ai(end_portfolio)
+
                     save_portfolio(end_portfolio)
 
                     current_equity, _, _ = calculate_portfolio_value(end_portfolio)
