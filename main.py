@@ -1050,35 +1050,65 @@ def process_buy_signals(portfolio, candidates):
 def check_market_status():
     """
     Checks the Taiwan Weighted Index (^TWII) status.
+    Fallback: If ^TWII fails, tries 0050.TW (Market Proxy).
     Returns (is_bullish, message, current_price, sma60).
     Strict Safety: Returns False if data fetch fails.
     """
-    print("Checking Market Status (^TWII)...")
-    try:
-        market = yf.Ticker("^TWII")
-        # Fetch 1y history to ensure enough data for SMA60
-        df = market.history(period="1y")
+    logging.info("Checking Market Status...")
 
-        if df.empty or len(df) < 60:
-            return False, "Insufficient Market Data", 0, 0
+    def _analyze_ticker(ticker_symbol):
+        try:
+            market = yf.Ticker(ticker_symbol)
+            # Fetch 1y history to ensure enough data for SMA60
+            df = market.history(period="1y")
 
-        # Calculate SMA60
-        df['SMA_60'] = df.ta.sma(length=60, close='Close')
+            if df.empty:
+                return None, f"{ticker_symbol} Empty"
 
-        current_close = df['Close'].iloc[-1]
-        sma60 = df['SMA_60'].iloc[-1]
+            if 'Close' not in df.columns:
+                return None, f"{ticker_symbol} No Close Col"
 
-        if pd.isna(sma60):
-            return False, "Market SMA60 NaN", current_close, 0
+            if len(df) < 60:
+                return None, f"{ticker_symbol} Insufficient Data ({len(df)})"
 
-        if current_close > sma60:
-            return True, "Bullish", current_close, sma60
-        else:
-            return False, "Bearish (Below SMA60)", current_close, sma60
+            # Calculate SMA60
+            df['SMA_60'] = df.ta.sma(length=60, close='Close')
 
-    except Exception as e:
-        print(f"Market Check Error: {e}")
-        return False, f"Error: {str(e)}", 0, 0
+            current_close = df['Close'].iloc[-1]
+            sma60 = df['SMA_60'].iloc[-1]
+
+            if pd.isna(sma60):
+                return None, f"{ticker_symbol} SMA60 NaN"
+
+            is_bullish = current_close > sma60
+            msg = "Bullish" if is_bullish else "Bearish (Below SMA60)"
+
+            return {
+                "is_bullish": is_bullish,
+                "msg": msg,
+                "price": current_close,
+                "sma60": sma60
+            }, None
+
+        except Exception as e:
+            return None, str(e)
+
+    # 1. Try ^TWII
+    result, error = _analyze_ticker("^TWII")
+    if result:
+        logging.info(f"Market Status (^TWII): {result['msg']}")
+        return result['is_bullish'], result['msg'], result['price'], result['sma60']
+
+    logging.warning(f"Market Check (^TWII) Failed: {error}. Trying Fallback (0050.TW)...")
+
+    # 2. Try Fallback 0050.TW
+    result, error = _analyze_ticker("0050.TW")
+    if result:
+        logging.info(f"Market Status (0050.TW Proxy): {result['msg']}")
+        return result['is_bullish'], f"Proxy: {result['msg']}", result['price'], result['sma60']
+
+    logging.error(f"Critical: Market Status Check Failed (Both ^TWII and 0050.TW). Error: {error}")
+    return False, f"Critical Error: {error}", 0, 0
 
 def get_stock_list():
     """
